@@ -15,9 +15,10 @@ cannot sideload apps at all.
 - **Home settings that change the look now take effect.** The on-TV app's WebView cancelled every
   page load, including the home's own reload, so the Look button, switching scenes on or off and
   the scene timer were saved but never shown. It now lets the home page reload itself.
-- **TV settings opens.** Fire OS's main Settings screen lives in Amazon's launcher package, so the
-  Home watcher took it for Amazon's home and sent you straight back. The watcher now leaves that
-  screen alone.
+- **TV settings opens.** Android's plain Settings action goes through Amazon's home on its way to
+  Fire OS's Settings screen, so the Home watcher sent you straight back. couch-tv now opens that
+  screen (`com.amazon.tv.launcher/.ui.MainSettingsActivity`) by name, and the watcher leaves
+  Amazon's settings screens alone.
 - **Builds that install over each other.** GitHub signs each build with a fixed key from the
   `DEBUG_KEYSTORE` secret, so an update keeps the app's settings and grants
   ([Signing](#signing-your-own-builds)).

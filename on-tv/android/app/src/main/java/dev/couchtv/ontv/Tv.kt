@@ -109,19 +109,20 @@ object Tv {
     }
 
     /**
-     * The Bluetooth or network settings screen, for the home's quick buttons. Fire OS has no
-     * Bluetooth settings action, so on a Fire TV its own screens are opened by name; any other TV
-     * gets the standard Android ones.
+     * The TV's main, Bluetooth or network settings screen. Fire OS has no Bluetooth settings
+     * action, and its plain Settings action goes through Amazon's home first (which the Fire TV
+     * Home watcher would send straight back), so on a Fire TV its own screens are opened by name;
+     * any other TV gets the standard Android ones.
      */
     fun openSettingsScreen(which: String) {
-        val fire = when (which) {
-            "bluetooth" -> "com.amazon.tv.settings.v2/.tv.controllers_bluetooth_devices.ControllersAndBluetoothActivity"
-            "network" -> "com.amazon.tv.settings.v2/.tv.network.NetworkActivity"
+        val (fire, action) = when (which) {
+            "settings" -> "com.amazon.tv.launcher/.ui.MainSettingsActivity" to Settings.ACTION_SETTINGS
+            "bluetooth" -> "com.amazon.tv.settings.v2/.tv.controllers_bluetooth_devices.ControllersAndBluetoothActivity" to Settings.ACTION_BLUETOOTH_SETTINGS
+            "network" -> "com.amazon.tv.settings.v2/.tv.network.NetworkActivity" to Settings.ACTION_WIFI_SETTINGS
             else -> throw ApiError(400, "unknown settings screen: $which")
         }
         val cn = android.content.ComponentName.unflattenFromString(fire)!!
-        start(if (hasPackage(cn.packageName)) Intent().setComponent(cn)
-            else Intent(if (which == "bluetooth") Settings.ACTION_BLUETOOTH_SETTINGS else Settings.ACTION_WIFI_SETTINGS))
+        start(if (hasPackage(cn.packageName)) Intent().setComponent(cn) else Intent(action))
     }
 
     fun startHome(): Boolean = try {
