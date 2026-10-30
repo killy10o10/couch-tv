@@ -23,11 +23,21 @@ android {
         buildConfigField("String[]", "BRIDGES", "{" + urls.joinToString(", ") { "\"" + it + "\"" } + "}")
     }
     buildFeatures { buildConfig = true }
+    signingConfigs {
+        // COUCHTV_KEYSTORE names a fixed key (alias androiddebugkey, password android), so every
+        // build installs over the last one. CI sets it from the DEBUG_KEYSTORE secret.
+        System.getenv("COUCHTV_KEYSTORE")?.takeIf { file(it).exists() }?.let { ks ->
+            create("fixed") {
+                storeFile = file(ks); storeType = "pkcs12"; storePassword = "android"
+                keyAlias = "androiddebugkey"; keyPassword = "android"
+            }
+        }
+    }
     buildTypes {
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("fixed") ?: signingConfigs.getByName("debug")
         }
     }
     compileOptions {
