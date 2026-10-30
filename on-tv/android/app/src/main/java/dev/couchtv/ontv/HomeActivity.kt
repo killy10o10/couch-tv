@@ -62,7 +62,9 @@ class HomeActivity : Activity() {
                     // The server may still be starting: try again shortly.
                     if (req.isForMainFrame) { ready = false; main.postDelayed({ load() }, 700) }
                 }
-                override fun shouldOverrideUrlLoading(view: WebView, req: WebResourceRequest) = true
+                // Only the home page itself may load here: its restart() (a new look, scenes, timer)
+                // reloads it with location.replace, which was cancelled along with everything else.
+                override fun shouldOverrideUrlLoading(view: WebView, req: WebResourceRequest) = !req.url.toString().startsWith("$base/tv/")
                 override fun shouldInterceptRequest(view: WebView, req: WebResourceRequest): WebResourceResponse? {
                     val u = req.url
                     if (u.host != "tvos.invalid") return null

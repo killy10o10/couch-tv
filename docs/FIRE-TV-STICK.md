@@ -12,6 +12,12 @@ cannot sideload apps at all.
 - **Bluetooth and Network buttons** at the top right of the home. Fire OS's long-press Home menu
   has neither. On a Fire TV they open Amazon's own screens (Fire OS has no Bluetooth settings
   action); other TVs get Android's standard ones.
+- **Home settings that change the look now take effect.** The on-TV app's WebView cancelled every
+  page load, including the home's own reload, so the Look button, switching scenes on or off and
+  the scene timer were saved but never shown. It now lets the home page reload itself.
+- **TV settings opens.** Fire OS's main Settings screen lives in Amazon's launcher package, so the
+  Home watcher took it for Amazon's home and sent you straight back. The watcher now leaves that
+  screen alone.
 - **Builds that install over each other.** GitHub signs each build with a fixed key from the
   `DEBUG_KEYSTORE` secret, so an update keeps the app's settings and grants
   ([Signing](#signing-your-own-builds)).
@@ -25,6 +31,8 @@ cannot sideload apps at all.
 | Survives a restart | Yes (the accessibility watcher stays on) |
 | Bluetooth button | Yes. If parental controls are on, Fire OS asks for the Prime Video PIN first |
 | Network button | Yes |
+| Gear tile: Home settings, TV settings | Yes (TV settings opens Fire OS's own Settings) |
+| One scene only, or Classic look | Yes: switch the other scenes off in Home settings, Look and scenes; the home reloads with your choice |
 | Phone remote | Opening apps works without ADB. Keys, typing and "what's playing" need the TV's own ADB (Connect ADB in the app) |
 | Keep watching | Only fills from shows started from the phone remote |
 
