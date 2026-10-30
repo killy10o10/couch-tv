@@ -14,12 +14,22 @@ android {
         versionName = "0.3"
     }
     buildFeatures { buildConfig = true }
+    signingConfigs {
+        // COUCHTV_KEYSTORE names a fixed key (alias androiddebugkey, password android), so every
+        // build installs over the last one. CI sets it from the DEBUG_KEYSTORE secret.
+        System.getenv("COUCHTV_KEYSTORE")?.takeIf { file(it).exists() }?.let { ks ->
+            create("fixed") {
+                storeFile = file(ks); storeType = "pkcs12"; storePassword = "android"
+                keyAlias = "androiddebugkey"; keyPassword = "android"
+            }
+        }
+    }
     buildTypes {
         release {
             // Not minified: libadb, Conscrypt and BouncyCastle use reflection, and the size saving is small.
             isMinifyEnabled = false
             // Signed with the local debug key so it installs without a keystore. Use your own key to publish.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("fixed") ?: signingConfigs.getByName("debug")
         }
     }
     compileOptions {
