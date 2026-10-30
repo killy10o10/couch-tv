@@ -42,6 +42,18 @@ jobs:
       - name: Android platform 34
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" > /dev/null
 
+      - name: Fixed signing key (optional)
+        # With a DEBUG_KEYSTORE secret (a base64 debug keystore, alias androiddebugkey, password
+        # android), every build is signed with the same key, so a new build installs over the last
+        # one. Without it, each run makes a fresh key, as before.
+        env:
+          DEBUG_KEYSTORE: ${{ secrets.DEBUG_KEYSTORE }}
+        run: |
+          if [ -n "$DEBUG_KEYSTORE" ]; then
+            mkdir -p ~/.android && echo "$DEBUG_KEYSTORE" | base64 -d > ~/.android/debug.keystore
+            echo "Signing with the DEBUG_KEYSTORE secret"
+          fi
+
       - name: Build the TV apps
         run: sh scripts/build-apk.sh
 
