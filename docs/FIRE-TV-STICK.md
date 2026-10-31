@@ -12,6 +12,9 @@ cannot sideload apps at all.
 - **Bluetooth and Network buttons** at the top right of the home. Fire OS's long-press Home menu
   has neither. On a Fire TV they open Amazon's own screens (Fire OS has no Bluetooth settings
   action); other TVs get Android's standard ones.
+- **Amazon's YouTube app** (`com.amazon.firetv.youtube`) counts as YouTube, so YouTube links,
+  YouTube search and "play by name" open in it. couch-tv only knew Google's YouTube package, which
+  a Fire TV doesn't have.
 
 Found on this stick and now part of the upstream project
 ([#3](https://github.com/Seagey/couch-tv/issues/3), [#4](https://github.com/Seagey/couch-tv/issues/4),
@@ -37,7 +40,7 @@ Found on this stick and now part of the upstream project
 | Network button | Yes |
 | Gear tile: Home settings, TV settings | Yes (TV settings opens Fire OS's own Settings) |
 | One scene only, or Classic look | Yes: switch the other scenes off in Home settings, Look and scenes; the home reloads with your choice |
-| Phone remote | Opening apps works without ADB. Keys, typing and "what's playing" need the TV's own ADB (Connect ADB in the app) |
+| Phone remote | Opening apps, "play by name" and the sleep timer work. Keys, typing, "what's playing" and power off need the TV's own ADB, and Fire OS 8.1.8.5 refuses it: Connect ADB is dropped by `adbd` within milliseconds, with no Allow prompt (a computer's ADB still works). Amazon's Fire TV phone app is the better remote here |
 | Keep watching | Only fills from shows started from the phone remote |
 
 ## Install
