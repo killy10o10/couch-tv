@@ -53,9 +53,8 @@ object FireHome {
         get() = isFireTv && App.homeEnabled(App.instance)
 
     /**
-     * Amazon's launcher package also holds Fire OS's main Settings screen (ACTION_SETTINGS opens
-     * `.ui.SettingsActivity`), so only its other screens count as Amazon's home. Without this the
-     * home's "TV settings" opened and was sent straight back here.
+     * Amazon's launcher package also holds Fire OS's Settings screens (`.ui.MainSettingsActivity`
+     * and others), so only its other screens count as Amazon's home.
      */
     fun isAmazonHome(pkg: String?, cls: String?) = pkg == AMAZON_HOME && cls?.contains("Settings") != true
 

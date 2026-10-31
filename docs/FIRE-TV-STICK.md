@@ -12,15 +12,18 @@ cannot sideload apps at all.
 - **Bluetooth and Network buttons** at the top right of the home. Fire OS's long-press Home menu
   has neither. On a Fire TV they open Amazon's own screens (Fire OS has no Bluetooth settings
   action); other TVs get Android's standard ones.
-- **Home settings that change the look now take effect.** The on-TV app's WebView cancelled every
+
+Found on this stick and now part of the upstream project
+([#3](https://github.com/Seagey/couch-tv/issues/3), [#4](https://github.com/Seagey/couch-tv/issues/4),
+[#5](https://github.com/Seagey/couch-tv/pull/5)):
+
+- **Home settings that change the look take effect.** The on-TV app's WebView cancelled every
   page load, including the home's own reload, so the Look button, switching scenes on or off and
-  the scene timer were saved but never shown. It now lets the home page reload itself.
+  the scene timer were saved but never shown.
 - **TV settings opens.** Android's plain Settings action goes through Amazon's home on its way to
   Fire OS's Settings screen, so the Home watcher sent you straight back. couch-tv now opens that
-  screen (`com.amazon.tv.launcher/.ui.MainSettingsActivity`) by name, and the watcher leaves
-  Amazon's settings screens alone.
-- **Builds that install over each other.** GitHub signs each build with a fixed key from the
-  `DEBUG_KEYSTORE` secret, so an update keeps the app's settings and grants
+  screen (`com.amazon.tv.launcher/.ui.MainSettingsActivity`) by name.
+- **Builds that install over each other**, with a fixed key from the `DEBUG_KEYSTORE` secret
   ([Signing](#signing-your-own-builds)).
 
 ## What works, and what does not
