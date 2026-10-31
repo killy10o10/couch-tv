@@ -220,7 +220,7 @@ class Server(private val ctx: Context, port: Int) : NanoWSD(port) {
             Tv.startUri(target, Apps.packageForLink(target)?.takeIf { Tv.hasPackage(it) }); Thread.sleep(1500)
             return json(200, ok().put("app", Apps.describe(Tv.frontPackage())?.let { JSONObject(it) } ?: JSONObject.NULL))
         }
-        if (target == "bluetooth" || target == "network") {
+        if (target == "bluetooth" || target == "network" || (target == "settings" && FireHome.isFireTv)) {
             Tv.openSettingsScreen(target)
             return json(200, ok())
         }

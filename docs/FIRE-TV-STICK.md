@@ -12,6 +12,13 @@ cannot sideload apps at all.
 - **Bluetooth and Network buttons** at the top right of the home. Fire OS's long-press Home menu
   has neither. On a Fire TV they open Amazon's own screens (Fire OS has no Bluetooth settings
   action); other TVs get Android's standard ones.
+- **Home settings that change the look now take effect.** The on-TV app's WebView cancelled every
+  page load, including the home's own reload, so the Look button, switching scenes on or off and
+  the scene timer were saved but never shown. It now lets the home page reload itself.
+- **TV settings opens.** Android's plain Settings action goes through Amazon's home on its way to
+  Fire OS's Settings screen, so the Home watcher sent you straight back. couch-tv now opens that
+  screen (`com.amazon.tv.launcher/.ui.MainSettingsActivity`) by name, and the watcher leaves
+  Amazon's settings screens alone.
 - **Builds that install over each other.** GitHub signs each build with a fixed key from the
   `DEBUG_KEYSTORE` secret, so an update keeps the app's settings and grants
   ([Signing](#signing-your-own-builds)).
@@ -25,6 +32,8 @@ cannot sideload apps at all.
 | Survives a restart | Yes (the accessibility watcher stays on) |
 | Bluetooth button | Yes. If parental controls are on, Fire OS asks for the Prime Video PIN first |
 | Network button | Yes |
+| Gear tile: Home settings, TV settings | Yes (TV settings opens Fire OS's own Settings) |
+| One scene only, or Classic look | Yes: switch the other scenes off in Home settings, Look and scenes; the home reloads with your choice |
 | Phone remote | Opening apps works without ADB. Keys, typing and "what's playing" need the TV's own ADB (Connect ADB in the app) |
 | Keep watching | Only fills from shows started from the phone remote |
 
@@ -98,6 +107,10 @@ curl -X POST http://<stick-ip>:5400/api/pair -H 'Content-Type: application/json'
   not couch-tv.
 - **Uninstalling the app removes its watcher and grants.** After a reinstall, redo Install steps
   5 to 7. An update (`adb install -r`, same signing key) keeps everything.
+- **Restart the stick after an update if Home lands on Amazon's home.** Fire OS keeps the watcher
+  switched on but does not always reconnect it after the app is updated (seen on 8.1.8.5). A
+  restart reconnects it. To check: `adb shell dumpsys accessibility | grep "Bound services"`
+  should list "Couch TV home watch".
 - **The setup screen remembers which button had focus.** Count your D-pad presses from what is
   highlighted, not from the left: it is easy to press Forget phones by mistake.
 - **Weather defaults to Sydney** until you set a place in Home settings or through the API.
