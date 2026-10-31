@@ -14,14 +14,15 @@ android {
         versionName = "0.3"
     }
     buildFeatures { buildConfig = true }
+    // Test builds: when COUCHTV_KEYSTORE names a keystore (a debug-style key, alias androiddebugkey,
+    // password android), release builds are signed with it, so one test build can update the last (#4).
+    val fixedKey = System.getenv("COUCHTV_KEYSTORE")?.let { file(it) }?.takeIf { it.isFile }
     signingConfigs {
-        // COUCHTV_KEYSTORE names a fixed key (alias androiddebugkey, password android), so every
-        // build installs over the last one. CI sets it from the DEBUG_KEYSTORE secret.
-        System.getenv("COUCHTV_KEYSTORE")?.takeIf { file(it).exists() }?.let { ks ->
-            create("fixed") {
-                storeFile = file(ks); storeType = "pkcs12"; storePassword = "android"
-                keyAlias = "androiddebugkey"; keyPassword = "android"
-            }
+        if (fixedKey != null) create("fixed") {
+            storeFile = fixedKey
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
         }
     }
     buildTypes {

@@ -8,11 +8,10 @@ screen. Open source (MIT).
 ## This fork: Fire TV Stick
 
 This fork runs couch-tv as the home screen of a **Fire TV Stick 4K (2nd gen) on Fire OS 8.1.8.5**,
-tested on the stick itself. It adds:
-
-- **Bluetooth and Network buttons** on the home (Fire OS's long-press Home menu has neither).
-- **GitHub builds signed with one fixed key**, so a new build installs over the last one and keeps
-  its settings.
+tested on the stick itself. It adds **Bluetooth and Network buttons** on the home (Fire OS's
+long-press Home menu has neither). The Fire TV fixes found here, and the fixed signing key for test
+builds, are part of the upstream project now ([#5](https://github.com/Seagey/couch-tv/pull/5),
+[#4](https://github.com/Seagey/couch-tv/issues/4)).
 
 ![couch-tv on a Fire TV Stick, with the Bluetooth and Network buttons at the top right](docs/screens/firestick-home.jpg)
 
@@ -30,8 +29,8 @@ the main repo, credited to each of them. Download the new apps from
 - **Fire TV sticks and Fire TV Cube (Fire OS).** The "lives on the TV" app now takes the Home key
   back: Amazon's own home cannot be switched off, so the app sees it come up and puts couch-tv's
   home straight back on top. Amazon's home still flashes up for a moment first. It needs two
-  one-off grants from a computer: [on-tv/README.md](on-tv/README.md#fire-tv-fire-os). Not yet
-  tried on a real Fire TV by us: if you have one, an issue saying how it went helps everyone.
+  one-off grants from a computer: [on-tv/README.md](on-tv/README.md#fire-tv-fire-os). Confirmed
+  on a Fire TV Stick 4K (2nd gen, Fire OS 8) by [killy10o10](https://github.com/Seagey/couch-tv/issues/3).
 - **Older TVs no longer crash on open.** Both TV apps used a part of Android that only Android 11
   and newer have. On Android 9 and 10 (most Fire TV sticks, and many older Android TVs) the home
   crashed as it opened. Fixed and checked on an Android 9 emulator: the old apps crash, the new
