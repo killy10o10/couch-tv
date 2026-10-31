@@ -12,9 +12,10 @@ cannot sideload apps at all.
 - **Bluetooth and Network buttons** at the top right of the home. Fire OS's long-press Home menu
   has neither. On a Fire TV they open Amazon's own screens (Fire OS has no Bluetooth settings
   action); other TVs get Android's standard ones.
-- **Amazon's YouTube app** (`com.amazon.firetv.youtube`) counts as YouTube, so YouTube links,
-  YouTube search and "play by name" open in it. couch-tv only knew Google's YouTube package, which
-  a Fire TV doesn't have.
+- **Amazon's YouTube app** (`com.amazon.firetv.youtube`) counts as YouTube, so the dock, the phone
+  remote and YouTube video links open in it, and a video link starts playing. couch-tv only knew
+  Google's YouTube package, which a Fire TV doesn't have. A YouTube *search* link opens the app
+  but not the results: Amazon's YouTube ignores the search part of the link.
 
 Found on this stick and now part of the upstream project
 ([#3](https://github.com/Seagey/couch-tv/issues/3), [#4](https://github.com/Seagey/couch-tv/issues/4),
