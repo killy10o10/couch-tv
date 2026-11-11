@@ -27,6 +27,22 @@ CERT, KEY = os.path.join(config.DATA, "cert.pem"), os.path.join(config.DATA, "ke
 ADB_KEY = os.path.expanduser(os.environ.get("ADB_KEY", "~/.android/adbkey"))
 
 
+# Android package names only: letters, digits and underscores, in two or more dot separated parts.
+# Anything that reaches `adb shell` as a package goes through this first, because adb_shell joins the
+# arguments into one line for the TV's shell (couch-tv#72: "a.b;touch /sdcard/proof" ran on the TV).
+PACKAGE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+")
+
+
+class UnsafeInput(ValueError):
+    """A value that must never reach the TV's shell."""
+
+
+def check_package(package):
+    if not isinstance(package, str) or len(package) > 200 or not PACKAGE_RE.fullmatch(package):
+        raise UnsafeInput(f"refused unsafe app name: {str(package)[:80]!r}")
+    return package
+
+
 def ensure_adb_key(path=None):
     """Make the ADB key pair the TV will ask you to trust, if there is not one yet."""
     path = path or ADB_KEY
@@ -35,6 +51,7 @@ def ensure_adb_key(path=None):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         keygen(path)
     return path
+
 
 CLIENT_NAME = config.CLIENT_NAME
 TV_BROADCAST = os.environ.get("TV_BROADCAST", "255.255.255.255")  # Wake-on-LAN; set to your subnet broadcast if it does not wake
@@ -324,6 +341,8 @@ class TV:
     async def _adb(self, *args, timeout=15, binary=False):
         """Mirror of the adb CLI forms we use ("shell ...", "exec-out ...", "get-state"), sent
         over the bridge's own ADB connection."""
+        if not self.paired:
+            raise TVUnavailable("TV is not paired yet")
         if args and args[0] == "get-state":
             return "device" if (self._dev and self._dev.available) else "offline"
         if not (self._dev and self._dev.available):
@@ -363,6 +382,8 @@ class TV:
         """Connect with this computer's adb key (the one the TV said "Always
         allow" to). Pure Python, inside the bridge process: the launchd python has macOS Local
         Network permission, the separate `adb` program does not ("No route to host")."""
+        if not self.paired:
+            return False
         try:
             if not self.ip:
                 await self._resolve()
@@ -392,6 +413,7 @@ class TV:
 
     async def launch_package(self, package):
         """Open an app by package. ADB first (always works), then the remote protocol."""
+        check_package(package)
         if await self.adb_ready():
             await self.adb("shell", "monkey", "-p", package, "-c",
                            "android.intent.category.LEANBACK_LAUNCHER", "1")
@@ -403,6 +425,8 @@ class TV:
     async def start_intent(self, uri, package=None, cold=False):
         """Open a JustWatch intent:// link exactly (with ADB), else its plain-link form.
         cold=True restarts the app first (some apps ignore links when already open)."""
+        if package:
+            check_package(package)
         uri = uri.replace("'", "")
         # JustWatch sometimes names an inner screen that newer app versions no longer have
         # (SBS); naming just the app lets Android pick the screen that takes the link.
@@ -424,6 +448,8 @@ class TV:
         return "remote"
 
     async def port_open(self, port=6466, timeout=1.0):
+        if not self.paired:
+            return False
         try:
             _, w = await asyncio.wait_for(asyncio.open_connection(self.ip or self.fallback_ip, port), timeout)
             w.close()
@@ -435,6 +461,8 @@ class TV:
         """Drop the library's own reconnect loop (it backs off to 30 s between tries) and connect
         straight away to the address we already know (no name lookup). Used when we know the TV
         just came back. Returns True when connected."""
+        if not self.paired:
+            return False
         if self._task and not self._task.done():
             self._task.cancel()
         try:
@@ -454,7 +482,7 @@ class TV:
     async def wake(self):
         """Wake-on-LAN. When the TV is off it leaves the network, so a magic packet is the only
         way to reach it. Works only if the TV keeps its network card awake in standby."""
-        if not self.mac or not self.wake_on_lan:
+        if not self.paired or not self.mac or not self.wake_on_lan:
             return
         mac = bytes.fromhex(self.mac.replace(":", ""))
         packet = b"\xff" * 6 + mac * 16
@@ -485,6 +513,28 @@ class TV:
             return None
         out = await self.adb("shell", "pm", "list", "packages")
         return {line.split(":", 1)[1].strip() for line in out.splitlines() if ":" in line}
+
+    async def open_bluetooth_settings(self):
+        """Open Android's own Bluetooth settings screen over ADB with a fixed command."""
+        if not await self.adb_ready():
+            raise TVUnavailable("ADB is not on")
+        out = await self.adb("shell", "am", "start", "-a", "android.settings.BLUETOOTH_SETTINGS", timeout=5)
+        if "Error" in out or "unable to resolve" in out.lower() or "not found" in out.lower():
+            # Fallback for Fire OS or devices without standard Bluetooth settings action
+            await self.adb("shell", "am", "start", "-n",
+                           "com.amazon.tv.settings.v2/.tv.controllers_bluetooth_devices.ControllersAndBluetoothActivity",
+                           timeout=5)
+
+    async def open_settings_screen(self, which):
+        """Open the TV's Bluetooth or network settings screen."""
+        if which == "bluetooth":
+            await self.open_bluetooth_settings()
+        elif which == "network":
+            if not await self.adb_ready():
+                raise TVUnavailable("ADB is not on")
+            await self.adb("shell", "am", "start", "-a", "android.settings.WIFI_SETTINGS", timeout=5)
+        else:
+            raise ValueError(f"unknown settings screen: {which}")
 
 
 class TVUnavailable(Exception):

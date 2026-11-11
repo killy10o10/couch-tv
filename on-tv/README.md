@@ -22,7 +22,7 @@ home button unless you switch that on.
 | **Turn the TV on** | yes (Wake-on-LAN) | **no** | Once the TV sleeps, this app sleeps too. See "Power on" below. |
 | What is playing | yes | yes, with ADB | Same `dumpsys media_session` reading as the bridge. Apps that report no title show the app only. |
 | Play a show by name | yes | yes | Same JustWatch lookup and deep-link table as the bridge, no key needed. |
-| Keep watching | yes | partial | Built from what was started from the phone on this TV. No imported history. |
+| Keep watching | yes | partial, with ADB | Built on this TV: shows started from the phone, and shows an app says it is playing for a minute or more. No imported history, no progress bar. See "Keep watching and people". |
 | Sleep timer | yes | yes, with ADB | Pause, then off. |
 | Screenshot (`/api/screenshot`) | yes | yes, with ADB | |
 | Picks and taste profile | yes | no | Needs "ask". |
@@ -34,7 +34,7 @@ home button unless you switch that on.
 ## Which TVs
 
 - **Yes:** Android TV and Google TV (Chromecast with Google TV, Google TV Streamer, Sony, TCL,
-  Hisense, Philips and other Google TV sets), Nvidia Shield, and Fire TV on Fire OS. Android 9 or newer.
+  Hisense, Philips and other Google TV sets), Nvidia Shield, and Fire TV on Fire OS. Android 7.1 or newer.
 - **No:** Samsung (Tizen), LG (webOS), Roku, Apple TV, Hisense VIDAA, and Fire TV sticks on Vega OS.
   These do not run Android apps. Use the computer bridge for those where it can reach them.
 
@@ -106,19 +106,26 @@ the TV, or on the setup page, signs every phone out.
 ## Use it as the home screen (optional)
 
 Switch on **Use as home screen** in Couch TV. On a plain Android TV that is enough. On Google TV the
-system launcher always wins the home button, so it also has to be switched off, from a computer:
+system launcher still wins the Home button, and **do not switch it off**: on some Google TVs (a
+Sony Bravia among them) the TV then loops at every restart
+([README](../README.md#if-your-tv-loops-after-a-restart)). Open Couch TV from the app row instead,
+or use option A's `apply.sh`, which takes the Home button with a watch and leaves the Google home on.
+If an older guide had you switch it off, switch it back on before the next restart:
 
 ```
-adb shell pm disable-user --user 0 com.google.android.apps.tv.launcherx   # Chromecast with Google TV and most Google TVs
-adb shell pm enable com.google.android.apps.tv.launcherx                  # undo
+adb shell pm enable com.google.android.apps.tv.launcherx
+adb shell pm enable com.google.android.tungsten.setupwraith
 ```
 
-Check the package name on your TV first (`adb shell pm list packages | grep launcher`). Some Google
-Home features stop working while it is off. The app never does this by itself.
+The app never switches anything off by itself.
 
 ### Fire TV (Fire OS)
 
-Works on Fire TV sticks, Cubes and TVs that run **Fire OS** (7 on Android 9, 8 on Android 11). It does
+Step by step on a Fire TV Stick, with the things that will save you time: [docs/FIRE-TV-STICK.md](../docs/FIRE-TV-STICK.md).
+
+Works on Fire TV sticks, Cubes and TVs that run **Fire OS** (6 on Android 7.1, 7 on Android 9, 8 on
+Android 11). Fire OS 6 (Fire TV Stick 4K 1st gen and older sticks) needs a release newer than 0.3,
+and network debugging on port 5555, because wireless pairing starts at Android 11. It does
 **not** work on the newer sticks that run **Vega OS**, which cannot sideload apps at all.
 
 Amazon's launcher cannot be switched off, and the Home key starts it by name, so no setting can
@@ -128,25 +135,36 @@ kind of TV. Two things to know:
 
 - **Amazon's home still flashes up for a moment** before Couch TV's comes back. Without root,
   that is as good as Fire OS allows.
-- It needs two one-off grants, over ADB from a computer (they survive reboots, so the computer is
+- It needs three one-off grants, over ADB from a computer (they survive reboots, so the computer is
   only needed once):
 
 ```
 adb shell pm grant dev.couchtv.ontv android.permission.WRITE_SECURE_SETTINGS
 adb shell appops set dev.couchtv.ontv SYSTEM_ALERT_WINDOW allow
+adb shell appops set dev.couchtv.ontv GET_USAGE_STATS allow
 ```
 
 The first lets the app switch on its own small accessibility watcher (it sees which window came
 forward and reads nothing else) and switch it back on if an update turns it off. The second lets
-the app come forward from the background. If you would rather not use an accessibility service,
-grant usage access instead of the first line (`adb shell appops set dev.couchtv.ontv GET_USAGE_STATS allow`)
-and the app polls the system's usage events instead. Where a Fire OS build still lets the TV use its
-own ADB, the activity log is followed as a third option.
+the app come forward from the background. The third is for Fire OS 6, which runs Amazon's own
+accessibility manager and never connects the watcher (the setting reads as on, but nothing is
+listening): with usage access the app polls the system's usage events instead, and Home comes back
+to Couch TV within a second or two. Where the watcher does connect, the third grant is not used, so
+it is safe to give on every Fire TV. If you would rather not use an accessibility service at all,
+give the third and skip the first. Where a Fire OS build still lets the TV use its own ADB, the
+activity log is followed as a last option.
 
-On a Fire TV the quick buttons also gain **Input** (the TV's own HDMI picker). Some Fire OS builds
-block the TV's own ADB, and then the phone remote's keys, typing, power off and "what's playing"
-do not work; opening apps, playing a show by name, volume on the TV's own speaker and the sleep
-timer still do.
+On a Fire TV the quick buttons also gain **Input** (the TV's own HDMI picker).
+
+**Current Fire OS (6.7.1.1, 7.6.6.9, 8.1.0.3 and newer) blocks apps on the TV from using the
+TV's own ADB** (Amazon's fix for CVE-2024-27350, 2024, which it backported to Fire OS 6). So on an up
+to date Fire TV, **Connect ADB** cannot work, and the setup screen says so. The phone remote's keys, typing, power off and "what's
+playing" do not work there; opening apps, playing a show by name, volume on the TV's own speaker
+and the sleep timer still do. ADB from another computer is not blocked, so for the full phone
+remote on a Fire TV use option B (the bridge), or Amazon's own Fire TV phone app for the keys.
+Reported in [issue #12](https://github.com/Seagey/couch-tv/issues/12) (Fire TV Stick, Fire OS 7.7.1.7)
+and [issue #50](https://github.com/Seagey/couch-tv/issues/50) (an Insignia Fire TV Edition on Fire OS 6.7.1.1,
+where Option C works as a home screen with the usage access grant).
 
 Confirmed on a **Fire TV Stick 4K (2nd gen, Fire OS 8.1, Android 11)** by
 [killy10o10](https://github.com/Seagey/couch-tv/issues/3), who also wrote a step-by-step setup guide:
@@ -162,10 +180,50 @@ Ported from the Fire TV work in [dlandman27's fork](https://github.com/dlandman2
 to them.
 
 The home's gear tile opens **Home settings** here too (language, weather place and units, look,
-scenes, apps, people, quick buttons; README, "Settings on the TV"). They are kept in this app
+scenes, glass panels, a video background, apps, people, quick buttons; README, "Settings on the TV"). They are kept in this app
 (`/api/settings`, next to the setup page's own settings), and the people list is the same one the
 setup page edits. One difference: this app has no file picker, so your own photos come from a web
 address.
+
+## Keep watching and people
+
+**Keep watching** fills itself on the TV. A show lands there when:
+
+- it was started from the phone (search, Ask, or a Keep watching tile), or
+- an app says it is playing it for a minute or more, however it was started (the TV remote, the
+  phone's arrow keys, the app's own menus). The same title has to play for the whole minute, and
+  the app's own position has to pass a minute too, so a preview that autoplays on an app's browse
+  screen never counts. This needs ADB connected, because the TV reads it from Android's media
+  sessions, the same reading as "What is playing". Netflix, Disney+, Prime Video and most others
+  say what is playing. Some say nothing (Netflix on some boxes) or only their own name ("PrimeVideo"
+  while a film plays, seen on a Sony): that is never kept as a show by itself. Instead the app reads
+  that app's row in Android's "Continue watching" (Watch Next), which Netflix and Prime keep up to
+  date, usually as you leave the show, and names the play from it, for the person picked when it
+  played. The app gives itself the permission to read those rows over its own ADB when it
+  connects. An app that says nothing and keeps no such row still cannot land there.
+
+Each card opens exactly the show it shows. One card per show (the latest episode), newest first,
+**up to 10**: the row slides along as you move right. A show drops off after **30 days** with no
+watching. The finder looks in the country on the setup page for the show's picture; left empty,
+that is the TV's own region when the TV is not in English (a German TV in Germany looks in DE),
+else AU. A title it cannot match exactly still goes in, with no picture, rather than another show's.
+YouTube videos, music and Twitch stay out. There is no progress bar and no imported history; those
+need the computer bridge (option B).
+
+**People** (the names at the top left, set on the setup page or in Home settings) decide whose
+Keep watching row the home shows. In on-TV mode, switching person:
+
+- shows that person's Keep watching row, and only theirs: what they watched on this TV;
+- tags what starts playing next as theirs, from the TV and from the phone (the phone remote follows
+  the TV's choice, and the other way round). The TV remembers who it is on, also after a restart;
+- tells Ask who is watching, if Ask is on.
+
+It does not pick your profile inside Netflix or the other apps, and there are no picks per person;
+both need the computer bridge (`app_profiles` in [docs/CONFIG.md](../docs/CONFIG.md)). With one
+person or none, there is no switcher and Keep watching shows everything watched on this TV.
+
+From 0.9 the row starts fresh: what was watched before then is not shown, because it does not say
+who watched it. It fills again as you watch.
 
 ## Power on
 
@@ -201,10 +259,12 @@ out every computer, so reconnect yours afterwards).
 | "Allow debugging?" never appears | Network debugging is off, or the TV suppresses the question (seen on an Android 14 Google TV). Use wireless debugging pairing instead. |
 | Worked, then stopped after a restart | Port 5555 is often switched off by a restart. Pair wireless debugging once: the app then turns it back on and finds the new port after every restart. |
 | Wireless debugging will not switch on | The TV is on Ethernet. Android only allows it on Wi-Fi. |
-| The phone page does not load | Phone and TV must be on the same network. The address changes if the router gives the TV a new one; reserve it in the router. iPhone asks for Local Network access once. |
+| The phone page does not load | Phone and TV must be on the same network. The address changes if the router gives the TV a new one; reserve it in the router. iPhone asks for Local Network access once. On an Android 17 phone, Chrome showing `ERR_TOO_MANY_RETRIES` means Chrome needs Settings, Apps, Chrome, Permissions, Nearby devices, Allow. |
 | Apps do not open from the phone | Android blocked an app start from the background. Connect ADB once: the app then has the permission it needs. |
 | Home button still goes to Google's home | See "Use it as the home screen". |
 | Server not answering after a TV update | Open Couch TV once; it also starts at boot. |
+| Keep watching stays empty | Connect ADB (the TV reads what is playing through it), then watch a show for a minute. Apps that do not say what is playing, YouTube and music never land there. See "Keep watching and people". |
+| App icons look soft on a big TV | Update the app: icons are now drawn at 256 px from the sharpest icon each app ships. Older versions drew them at the TV's own density, often 96 px. |
 
 ## How it works
 

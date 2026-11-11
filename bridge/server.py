@@ -4,6 +4,9 @@ Run: .venv/bin/python bridge/server.py   (settings come from config.json, see co
 """
 import asyncio
 import contextvars
+import hashlib
+import hmac
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -11,6 +14,7 @@ import os
 import re
 import socket
 import time
+import urllib.parse
 from collections.abc import MutableMapping
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -25,11 +29,14 @@ import store
 import taste
 from tv import TV, TVUnavailable, intent_to_link
 import samsung
+import lg
+import roku
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 REMOTE_DIR = os.path.join(ROOT, "remote", "dist")
 LAUNCHER_DIR = os.path.join(ROOT, "tv-home", "web")
+SHIM_PATH = os.path.join(HERE, "web", "shim.js")
 PORT = int(os.environ.get("PORT") or config.BRIDGE["port"])
 HOME_TZ = ZoneInfo(config.TIMEZONE)   # the home's time zone (weather.timezone in config.json)
 
@@ -43,8 +50,15 @@ TV_CONFIG = {"default": config.DEFAULT_TV, "tvs": config.TVS}
 
 
 def make_tv(cfg):
-    """A Samsung ("kind": "samsung", bridge/samsung.py) or an Android or Google TV (tv.py)."""
-    return samsung.SamsungTV(cfg) if cfg.get("kind") == "samsung" else TV(cfg)
+    """A Samsung ("kind": "samsung", bridge/samsung.py), an LG ("kind": "lg", bridge/lg.py), a Roku
+    ("kind": "roku", bridge/roku.py) or an Android or Google TV (tv.py)."""
+    if cfg.get("kind") == "samsung":
+        return samsung.SamsungTV(cfg)
+    if cfg.get("kind") == "lg":
+        return lg.LGTV(cfg)
+    if cfg.get("kind") == "roku":
+        return roku.RokuTV(cfg)
+    return TV(cfg)
 
 
 TVS = {c["id"]: make_tv(c) for c in TV_CONFIG["tvs"]}
@@ -115,6 +129,11 @@ def now_iso():
     return datetime.now(HOME_TZ).isoformat(timespec="seconds")
 
 
+def cur_who():
+    """Who is on the couch at the TV this request or loop is for (each TV keeps its own)."""
+    return store.current_who(_current.get())
+
+
 class ApiError(Exception):
     def __init__(self, status, message):
         super().__init__(message)
@@ -123,6 +142,204 @@ class ApiError(Exception):
 
 def ok(**fields):
     return web.json_response({"ok": True, **fields})
+
+
+def lan_ipv4():
+    """This computer's home network IPv4 (a UDP connect sends nothing, it only picks the route)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 9))   # a documentation address: never sent, only routed
+        return s.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        s.close()
+
+
+def host_name(value):
+    """The name or address in a Host header or a config entry, lower case, without the port, the
+    IPv6 brackets or a trailing dot ("My-Computer.local:5400" -> "my-computer.local", "[::1]:5400" -> "::1")."""
+    value = str(value or "").strip().lower()
+    if "://" in value:
+        value = value.split("://", 1)[1]
+    value = value.split("/", 1)[0]
+    try:
+        return (urllib.parse.urlsplit(f"//{value}").hostname or "").rstrip(".")
+    except ValueError:
+        return ""
+
+
+def is_ip(name):
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        return False
+
+
+def allowed_hosts():
+    """Names and addresses the bridge answers to (Host header check and CORS)."""
+    hosts = {"127.0.0.1", "localhost", "::1"}
+    for h in [config.BRIDGE.get("host")] + list(config.BRIDGE.get("fallback_hosts") or []):
+        h = host_name(h)
+        if h:
+            hosts.add(h)
+    ip = lan_ipv4()
+    if ip:
+        hosts.add(ip)
+    try:
+        h = host_name(socket.gethostname())
+        if h:
+            hosts.add(h)
+            hosts.add(h if h.endswith(".local") else f"{h}.local")
+    except OSError:
+        pass
+    return hosts
+
+
+def is_allowed_host(request):
+    """DNS rebinding guard (couch-tv#73). A rebinding page reaches the bridge under the attacker's own
+    name, so a Host the bridge does not know is refused. Any IP address passes (rebinding needs a
+    name; this also covers a computer with two network connections, and Docker), and so does any
+    .local name (only the home network answers for those). No Host header at all is a script, not a
+    browser, so it passes too."""
+    raw = request.headers.get("Host")
+    if raw is None:
+        return True
+    name = host_name(raw)
+    if not name:
+        return False
+    return is_ip(name) or name.endswith(".local") or name in allowed_hosts()
+
+
+def is_allowed_origin(request, origin):
+    """Origin allowlist for CORS (couch-tv#73): the bridge's own origins and TV front-end origins."""
+    if not origin:
+        return False
+    clean = origin.rstrip("/").lower()
+    # 1. Front-end origins used by the TV apps:
+    # "null" is sent by browsers for local file:// WebViews (Android WebView, webOS, Tizen).
+    # NOTE: Because any website can emit Origin: null (e.g. from a sandboxed iframe),
+    # Origin: null is allowed for the TV apps, but only the pairing key (config.PAIRING_KEY)
+    # protects against malicious websites sending Origin: null.
+    # "file://" is sent literally by some embedded Chromium / WebViews.
+    # "http(s)://home.tvos.invalid" is used by couch-tv's Android TV offline launcher.
+    if clean == "null" or clean.startswith("file:") or clean in ("http://home.tvos.invalid", "https://home.tvos.invalid"):
+        return True
+    if clean.startswith(("widget:", "wgt:", "tizen:")):
+        return True
+
+    # 2. Bridge's own origins: the page came from the very address this request went to (the Host
+    # header passed the DNS rebinding check), or one of the bridge's known names.
+    hosts = allowed_hosts()
+    try:
+        parsed = urllib.parse.urlsplit(clean)
+        host_hdr = (request.headers.get("Host") or "").strip().lower() if request is not None else ""
+        if parsed.scheme in ("http", "https") and host_hdr and parsed.netloc == host_hdr and is_allowed_host(request):
+            return True
+        if parsed.scheme in ("http", "https"):
+            parsed_host = (parsed.hostname or "").lower()
+            parsed_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            allowed_ports = {PORT, 5173, 5400}
+            if request and hasattr(request, "url") and request.url.port:
+                allowed_ports.add(request.url.port)
+            if parsed_host in hosts and parsed_port in allowed_ports:
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
+def extract_auth_key(request):
+    """Extract pairing/API key from Authorization header, X-API-Key, or ?key= / ?token=."""
+    auth = request.headers.get("Authorization") or ""
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        if token:
+            return token
+    api_key = (request.headers.get("X-API-Key") or "").strip()
+    if api_key:
+        return api_key
+    q_key = (request.query.get("key") or request.query.get("token") or "").strip()
+    if q_key:
+        return q_key
+    return None
+
+
+def is_authed(request):
+    if not config.PAIRING_KEY:
+        return True
+    key = extract_auth_key(request)
+    if not key:
+        return False
+    return key_matches(key)
+
+
+def key_matches(given):
+    # bytes, so a key with non-ASCII characters is simply wrong instead of a 500
+    return hmac.compare_digest(str(given).encode(), config.PAIRING_KEY.encode())
+
+
+# Wrong pairing keys, per client address: {ip: [(time, fingerprint of the wrong key), ...]}.
+# Only DIFFERENT wrong keys count, so a phone or TV still holding an old key after the key changed
+# (polling every few seconds) never locks itself out, while guessing is limited to 5 keys a minute.
+# The address is the TCP peer (aiohttp's request.remote); X-Forwarded-For is never read.
+_failed_attempts = {}
+RATE_LIMIT_MAX = 5
+RATE_LIMIT_WINDOW = 60.0
+RATE_LIMIT_ADDRESSES = 1000   # memory bound: at most this many addresses are remembered
+
+
+def client_ip(request):
+    """The address to rate limit, or None for the computer itself (the MCP server, Claude, scripts:
+    anything on the bridge computer can read config.json anyway, and a local reverse proxy would
+    otherwise let one wrong key lock everyone out)."""
+    ip = (getattr(request, "remote", None) or "").removeprefix("::ffff:")
+    if not ip:
+        return None
+    try:
+        if ipaddress.ip_address(ip).is_loopback:
+            return None
+    except ValueError:
+        pass
+    return ip
+
+
+def _recent(ip, now):
+    cutoff = now - RATE_LIMIT_WINDOW
+    return [a for a in _failed_attempts.get(ip, []) if a[0] > cutoff]
+
+
+def is_rate_limited(ip, now=None):
+    if not ip:
+        return False
+    now = time.time() if now is None else now
+    recent = _recent(ip, now)
+    if recent:
+        _failed_attempts[ip] = recent
+    else:
+        _failed_attempts.pop(ip, None)
+    return len(recent) >= RATE_LIMIT_MAX
+
+
+def record_failed_attempt(ip, key, now=None):
+    if not ip:
+        return
+    now = time.time() if now is None else now
+    fp = hashlib.sha256(str(key).encode("utf-8", "replace")).hexdigest()[:16]
+    recent = _recent(ip, now)
+    if any(a[1] == fp for a in recent):
+        return                      # the same wrong key again: an old key, not a guess
+    recent.append((now, fp))
+    _failed_attempts.pop(ip, None)
+    _failed_attempts[ip] = recent   # newest last, so the oldest go first below
+    if len(_failed_attempts) > RATE_LIMIT_ADDRESSES:
+        for k in list(_failed_attempts):
+            if not _recent(k, now):
+                _failed_attempts.pop(k, None)
+        while len(_failed_attempts) > RATE_LIMIT_ADDRESSES:
+            _failed_attempts.pop(next(iter(_failed_attempts)))
 
 
 async def body(request):
@@ -144,12 +361,48 @@ def record_action(request, tool, args, success):
 
 
 # ---------- middleware: CORS + errors ----------
+OPEN_PATHS = {"/api/health", "/api/pair"}
+
+
 @web.middleware
 async def middleware(request, handler):
+    # 1. Host header validation against DNS rebinding (couch-tv#73)
+    if not is_allowed_host(request):
+        return web.Response(status=403, text=(
+            "forbidden host: the couch-tv bridge does not know the name this page was opened by. "
+            "Open it by the computer's number address or its .local name, or add this name to "
+            "bridge.fallback_hosts in config.json and restart the bridge."))
+
+    # 2. Origin check: requests from disallowed origins must not run (couch-tv#73)
+    origin = request.headers.get("Origin")
+    origin_ok = is_allowed_origin(request, origin) if origin else False
+    if origin and not origin_ok:
+        return web.Response(status=403, text="forbidden origin")
+
     if request.method == "OPTIONS":
         resp = web.Response(status=204)
     else:
         try:
+            # 3. Refuse POST without application/json (couch-tv#73)
+            if request.method == "POST" and request.content_type != "application/json":
+                raise ApiError(415, "Content-Type must be application/json")
+
+            # 4. Check pairing key authentication & rate limiting for protected API endpoints (couch-tv#73)
+            path = request.path
+            is_api = path.startswith("/api/")
+            if is_api and path not in OPEN_PATHS and config.PAIRING_KEY:
+                ip = client_ip(request)
+                if is_rate_limited(ip):
+                    raise ApiError(429, "Too many wrong pairing keys. Please wait a minute.")
+                key = extract_auth_key(request)
+                if key:
+                    if not key_matches(key):
+                        record_failed_attempt(ip, key)
+                        await asyncio.sleep(0.3)
+                        raise ApiError(401, "invalid pairing key")
+                else:
+                    raise ApiError(401, "pairing key required")
+
             tv_id = request.query.get("tv")
             if not tv_id and request.method == "POST" and request.body_exists:
                 try:
@@ -173,9 +426,13 @@ async def middleware(request, handler):
         except Exception as e:
             log.exception("handler failed")
             resp = web.json_response({"ok": False, "error": f"bridge error: {e}"}, status=500)
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Ask-Id"
+
+    # Set CORS headers only when origin is allowed (couch-tv#73)
+    if origin and origin_ok:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Ask-Id, Authorization, X-API-Key"
+        resp.headers["Vary"] = "Origin"
     return resp
 
 
@@ -219,7 +476,7 @@ def now_payload():
         playing["item"] = item = None
     out_playing = None
     if item:
-        out_playing = {k: v for k, v in item.items() if k != "package"} | {"source": "bridge"}
+        out_playing = {k: v for k, v in item.items() if k not in ("package", "ts", "who")} | {"source": "bridge"}
     if media_now and media_now.get("package") == pkg:
         live = {"state": media_now["state"], "position_ms": media_now["position_ms"],
                 "updated": datetime.fromtimestamp(media_now["read_at"], HOME_TZ).isoformat(
@@ -251,14 +508,46 @@ def now_payload():
         "playing": out_playing,
         "sleep": {"ends": sleep["ends"]},
         "waking": waking["on"],
-        "who": store.current_who(),
+        "who": cur_who(),
         "picture": picture_state.get("mode"),
     }
 
 
 # ---------- handlers ----------
 async def h_health(request):
-    return ok(tv_connected=tv.connected, adb=tv.adb_ok, version="1")
+    authed = is_authed(request)
+    return ok(
+        tv_connected=tv.connected,
+        adb=tv.adb_ok,
+        version="1",
+        auth="ok" if authed else "required",
+        paired=authed,
+    )
+
+
+async def h_pair(request):
+    b = await body(request)
+    given = str(b.get("key") or "").strip()
+    if not config.PAIRING_KEY:
+        return ok(paired=True, note="no pairing key required")
+    # Checked after the body is read, with no await before the key is compared and the miss is
+    # recorded: checked before it, parallel requests could all pass while their bodies arrive.
+    ip = client_ip(request)
+    if is_rate_limited(ip):
+        raise ApiError(429, "Too many wrong pairing keys. Please wait a minute.")
+    if not given:
+        raise ApiError(400, "pairing key is required")
+    if not key_matches(given):
+        record_failed_attempt(ip, given)
+        await asyncio.sleep(0.3)
+        raise ApiError(401, "That pairing key is not right. Check config.json.")
+    return ok(paired=True, token=config.PAIRING_KEY, note="paired")
+
+
+async def h_bridge_shim(request):
+    if not os.path.isfile(SHIM_PATH):
+        raise web.HTTPNotFound()
+    return web.FileResponse(SHIM_PATH, headers={"Cache-Control": "no-cache", "Content-Type": "application/javascript"})
 
 
 async def h_now(request):
@@ -278,9 +567,11 @@ def push_now():
 
 
 async def h_events(request):
-    resp = web.StreamResponse(headers={
-        "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
-        "Access-Control-Allow-Origin": "*", "X-Accel-Buffering": "no"})
+    headers = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    origin = request.headers.get("Origin")
+    if origin and is_allowed_origin(request, origin):   # sent before the middleware sees it (#73)
+        headers.update({"Access-Control-Allow-Origin": origin, "Vary": "Origin"})
+    resp = web.StreamResponse(headers=headers)
     await resp.prepare(request)
     q = asyncio.Queue()
     entry = (q, _current.get())
@@ -308,6 +599,17 @@ async def h_key(request):
     await tv.key(str(key), hold=bool(data.get("hold")))
     record_action(request, "key", {"key": key}, True)
     return ok(key=key)
+
+
+async def h_pointer(request):
+    """LG only: move the TV's pointer ({"dx", "dy"}), click ({"click": true}) or scroll ({"scroll": dy})."""
+    data = await body(request)
+    if not hasattr(tv, "pointer"):
+        raise ApiError(400, "only an LG TV has a pointer")
+    tv.require()
+    clamp = lambda v: max(-400, min(400, int(v or 0)))
+    await tv.pointer(clamp(data.get("dx")), clamp(data.get("dy")), bool(data.get("click")), clamp(data.get("scroll")))
+    return ok()
 
 
 async def h_text(request):
@@ -348,6 +650,15 @@ async def h_launch(request):
         await asyncio.sleep(2)
         record_action(request, "launch", {"app": target}, True)
         return ok(app=apps.describe_package(tv.current_package))
+    if target in ("bluetooth", "network") and hasattr(tv, "open_settings_screen"):
+        try:
+            await tv.open_settings_screen(target)
+            record_action(request, "launch", {"app": target}, True)
+            return ok(app=target)
+        except TVUnavailable as e:
+            raise ApiError(503, str(e))
+        except Exception as e:
+            raise ApiError(500, f"could not open {target} settings: {e}")
     app = apps.BY_ID.get(target) or apps.BY_PACKAGE.get(target)
     if app is None:
         if "." not in target:
@@ -494,13 +805,14 @@ async def play(title, season=None, episode=None, service=None, who=None, resume=
         if cold == "background":
             cold = await tv.front_package() != app["package"]
         try:
-            await tv.start_intent(link, app["package"], cold=bool(cold))
+            extra = {"media_type": "series" if best["type"] == "tv" else "movie"} if tv.kind == "roku" else {}
+            await tv.start_intent(link, app["package"], cold=bool(cold), **extra)
             if await tv.wait_for_app({app["package"]}, timeout=10):
                 method = "deeplink"
         except Exception as e:
             log.warning("deep link failed for %s: %s", app["id"], e)
         if method and tv.can_read_media:
-            started, picked = await get_it_playing(app, link, who or store.current_who())
+            started, picked = await get_it_playing(app, link, who or cur_who())
             log.info("play %s in %s: %s%s", best["title"], app["name"],
                      "playing" if started else "not playing yet", f" (profile {picked})" if picked else "")
             if started:
@@ -532,6 +844,40 @@ async def h_tizen_next(request):
     if tv.kind != "samsung":
         raise ApiError(400, "only for Samsung TVs")
     return ok(job=await tv.tizen_next())
+
+
+async def h_webos_apps(request):
+    """The couch-tv app on an LG TV asks here for the TV's apps (webOS may not tell the app)."""
+    if tv.kind != "lg":
+        raise ApiError(400, "only for LG TVs")
+    return ok(apps=await tv.apps_on_tv())
+
+
+async def h_roku_apps(request):
+    """The couch-tv channel on a Roku asks here for the Roku's channels, in the order arranged from the
+    phone (the Roku has no app list a channel may read). Each has "icon", the bridge's copy of the Roku's
+    own icon, and "logo", true when the channel has a bundled one named after "package"."""
+    if tv.kind != "roku":
+        raise ApiError(400, "only for Roku TVs")
+    tv.require()
+    listed = await tv.apps_on_tv()
+    saved, _, was_saved = effective_order()
+    rank = {a["package"]: i for i, a in enumerate(saved)} if was_saved else {}
+    known = {a["package"]: i for i, a in enumerate(apps.APPS)}
+    listed.sort(key=lambda c: (rank.get(c["package"], 9999), known.get(c["package"], 9999), c["title"].lower()))
+    tv_q = "" if _current.get() == DEFAULT_TV else "?tv=" + _current.get()
+    return ok(apps=[{"id": c["id"], "title": c["title"], "package": c["package"],
+                     "icon": f"/api/roku/icon/{c['id']}{tv_q}"} for c in listed])
+
+
+async def h_roku_icon(request):
+    if tv.kind != "roku":
+        raise ApiError(400, "only for Roku TVs")
+    try:
+        data, kind = await tv.icon(request.match_info["id"])
+    except (roku.RokuError, ValueError, TVUnavailable) as e:
+        raise ApiError(404, str(e))
+    return web.Response(body=data, content_type=kind.split(";")[0], headers={"Cache-Control": "max-age=86400"})
 
 
 async def h_tizen_answer(request):
@@ -629,11 +975,11 @@ def finish_play(best, app, method, note, season, episode, who, ep_info=None):
     item = {"title": best["title"], "year": best["year"], "type": best["type"],
             "poster": best["poster"], "backdrop": best["backdrop"], "service": app["id"],
             "season": season, "episode": episode, "started": now_iso(),
-            "package": app["package"]} | extra
+            "package": app["package"], "who": who, "ts": time.time()} | extra
     playing["item"] = item
     store.add_history({"title": best["title"], "year": best["year"], "type": best["type"],
                        "poster": best["poster"], "backdrop": best["backdrop"],
-                       "service": app["id"], "who": who,
+                       "service": app["id"], "who": who, "tv": _current.get(),
                        "season": season, "episode": episode,
                        "episode_title": extra.get("episode_title"),
                        "duration_ms": extra.get("duration_ms"), "when": item["started"],
@@ -652,7 +998,7 @@ async def h_play(request):
         raise ApiError(400, "title is required")
     # No season asked for: open the show where they are up to, never episode 1.
     result = await play(title, data.get("season"), data.get("episode"), data.get("service"),
-                        store.norm_who(data.get("who")) or store.current_who(),
+                        store.norm_who(data.get("who")) or cur_who(),
                         resume=not data.get("season"))
     record_action(request, "play", {k: data[k] for k in ("title", "season", "episode", "service")
                                     if data.get(k)}, True)
@@ -660,7 +1006,7 @@ async def h_play(request):
 
 
 async def h_who_get(request):
-    return ok(who=store.current_who())
+    return ok(who=cur_who())
 
 
 async def h_who_set(request):
@@ -668,7 +1014,7 @@ async def h_who_set(request):
     who = store.norm_who(data.get("who"))
     if not who:
         raise ApiError(400, "who must be " + ", ".join(config.PEOPLE_IDS) + " or both")
-    store.save_who(who)
+    store.save_who(who, _current.get())
     push_now()
     return ok(who=who)
 
@@ -700,8 +1046,9 @@ async def h_people_set(request):
     people = [{**{k: old[i["id"]][k] for k in ("kid", "guest") if k in old.get(i.get("id"), {})}, **i}
               if isinstance(i, dict) and i.get("id") in old else i for i in people]
     config.set_people(people)
-    if store.current_who() not in (None, "both", *config.PEOPLE_IDS):
-        store.save_who(None)   # the person on the couch was removed
+    for tv_id in TVS:   # the person on the couch at a TV was removed
+        if store.current_who(tv_id) not in (None, "both", *config.PEOPLE_IDS):
+            store.save_who(None, tv_id)
     record_action(request, "people", {"count": len(config.PEOPLE)}, True)
     for tv_id in TVS:
         with_tv(tv_id, push_now)
@@ -744,12 +1091,45 @@ async def h_screens_open(request):
 
 
 # ---------- power and volume ----------
+power_off_at = {}   # per TV: when the phone last turned it off
+
+
+async def _home_after_wake(t):
+    """LG, after a power-on from the phone: if the power-on hook did not run (off and on again
+    quicker than the watcher reads the TV), open couch-tv anyway. An input is left alone with
+    leave_inputs, as the hook does."""
+    await asyncio.sleep(6)
+    if not (t.is_on and t.home_on_wake_until and t.visible is not None and t.visible != t.app_id):
+        return
+    if t.leave_inputs and t.INPUT.match(t.visible):
+        return
+    t.home_on_wake_until = 0.0
+    try:
+        await t._launch(t.app_id, quiet=False)
+        t._note("switched on from the phone, opened couch-tv")
+    except Exception as e:
+        log.warning("home after wake: %s", e)
+
+
 async def h_power(request):
     data = await body(request)
     state = data.get("state")
     if state not in ("on", "off", "toggle"):
         raise ApiError(400, "state must be on, off or toggle")
     started = time.monotonic()
+    if hasattr(tv, "home_on_wake_until") and tv.connected:
+        # LG: the phone's idea of on or off can be seconds behind (Quick Start+ standby still
+        # answers). Read the TV now; and a second "off" just after it went off means "on again":
+        # the button was pressed to wake it.
+        try:
+            await tv._read_power()
+        except Exception:
+            pass
+        if state == "off" and tv.is_on is False and time.monotonic() - power_off_at.get(_current.get(), -99) < 20:
+            log.info("power off asked again just after it went off: turning it on")
+            state = "on"
+        elif state == "toggle":
+            state = "off" if tv.is_on else "on"
     log.info("power %s requested (connected=%s, is_on=%s)", state, tv.connected, tv.is_on)
     if state == "on":
         waking["on"] = True
@@ -759,6 +1139,8 @@ async def h_power(request):
         finally:
             waking["on"] = False
             push_now()
+        if hasattr(tv, "home_on_wake_until"):
+            asyncio.create_task(_home_after_wake(TVS[_current.get()]))
     else:
         tv.require()
         cur = tv.is_on
@@ -769,6 +1151,8 @@ async def h_power(request):
                 await asyncio.sleep(0.25)
                 if tv.is_on == target:
                     break
+    if state == "off":
+        power_off_at[_current.get()] = time.monotonic()
     record_action(request, "power", {"state": state}, True)
     on = tv.is_on
     log.info("power %s done in %.1fs (connected=%s, is_on=%s)", state,
@@ -811,10 +1195,15 @@ async def power_on():
         if tv.is_on or loop.time() >= end:
             break
         log.info("power on: TV in standby, trying %s", step)
-        if step == "wol":
-            await tv.wake()
-        else:
-            await tv.key(step)
+        try:
+            if step == "wol":
+                await tv.wake()
+            else:
+                await tv.key(step)
+        except Exception as e:
+            # An LG woken by Wake-on-LAN refuses POWER while it is still starting up. Keep waiting
+            # for it to say it is on instead of failing the request (#56).
+            log.info("power on: %s press failed (%s), still waiting", step, e)
         for _ in range(16):
             await asyncio.sleep(0.25)
             if tv.is_on:
@@ -842,7 +1231,7 @@ async def h_volume(request):
             raise ApiError(400, "action must be up, down or mute, or send level")
         steps = 1 if action == "mute" else max(1, min(int(data.get("steps", 1)), 20))
         if action == "mute" and hasattr(tv, "set_mute") and tv.volume["known"]:
-            await tv.set_mute(not tv.volume["muted"])   # Samsung: set over UPnP, its mute key is ignored
+            await tv.set_mute(not tv.volume["muted"])   # Samsung: set over UPnP, its mute key is ignored. LG: over SSAP
             steps = 0
         for _ in range(steps):
             await tv.key(keys[action])
@@ -876,7 +1265,7 @@ async def h_ask(request):
     text = (data.get("text") or "").strip()
     if not text:
         raise ApiError(400, "text is required")
-    result = await claude.ask(text, store.norm_who(data.get("who")) or store.current_who(), asks,
+    result = await claude.ask(text, store.norm_who(data.get("who")) or cur_who(), asks,
                               _current.get())
     return ok(**result)
 
@@ -885,7 +1274,7 @@ async def h_recs(request):
     who = store.norm_who(request.query.get("who"))
     picks, updated = await claude.cached_recs(who)
     return web.json_response({"ok": True, "updated": updated,
-                              "continue": store.continue_watching(who), "picks": picks})
+                              "continue": continue_items(who), "picks": picks})
 
 
 async def h_api_missing(request):
@@ -900,18 +1289,6 @@ async def h_options(request):
 PLACEHOLDER = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width">
 <title>{name}</title><body style="font:16px system-ui;background:#111;color:#eee;padding:24px">
 <h1>{name}</h1><p>Not built yet. The bridge API is live at <a style="color:#8cf" href="/api/now">/api/now</a>.</p>"""
-
-
-def lan_ipv4():
-    """This computer's home network IPv4 (a UDP connect sends nothing, it only picks the route)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("192.0.2.1", 9))   # a documentation address: never sent, only routed
-        return s.getsockname()[0]
-    except OSError:
-        return ""
-    finally:
-        s.close()
 
 
 def static_handler(folder, name):
@@ -937,10 +1314,16 @@ def static_handler(folder, name):
             ip = (sock[0] if sock else "").removeprefix("::ffff:")
             if ip.count(".") != 3 and not ip.startswith("::1"):
                 ip = lan_ipv4()   # the phone came in over IPv6: hand it the IPv4 instead
+            with open(target, encoding="utf-8") as f:
+                html = f.read()
+            tags = []
             if ip.count(".") == 3 and not ip.startswith("127."):
-                with open(target, encoding="utf-8") as f:
-                    html = f.read().replace("<head>", '<head>\n  <meta name="lan-ip" content="%s">' % ip, 1)
-                return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-cache"})
+                tags.append('<meta name="lan-ip" content="%s">' % ip)
+            if folder == REMOTE_DIR:
+                tags.append('<script src="/bridge/shim.js"></script>')
+            if tags and "<head>" in html:
+                html = html.replace("<head>", "<head>\n  " + "\n  ".join(tags), 1)
+            return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-cache"})
         ctype = mimetypes.guess_type(target)[0] or "application/octet-stream"
         if target.endswith(".webmanifest"):
             ctype = "application/manifest+json"
@@ -1140,7 +1523,10 @@ async def h_app_order_set(request):
 # over config.json on that TV (docs/CONFIG.md). The bridge only checks their shape; it does not act
 # on them. Anything it does not know is dropped.
 SETTINGS_MAX = 32 * 1024
-SETTINGS_LANGS = ("en", "es", "es-MX")
+SETTINGS_LANGS = config.LANGUAGES
+# The most personal photos the home keeps. The TV home (tv-home/web/app.js MAX_PHOTOS) and the
+# launcher (MainActivity.kt MAX_PHOTOS) use the same number: change all three together.
+MAX_PHOTOS = 50
 _PHOTO_FILE = re.compile(r"[A-Za-z0-9_-]{1,64}\.jpg")
 _PACKAGE = re.compile(r"[A-Za-z0-9_.:-]{1,200}")
 
@@ -1182,8 +1568,40 @@ def clean_settings(s):
         out["wx_unit"] = s["wx_unit"]
     if s.get("wx_every") in (15, 30, 60):
         out["wx_every"] = s["wx_every"]
-    if s.get("look") in ("night", "classic"):
+    if s.get("look") in ("night", "oled", "classic"):
         out["look"] = s["look"]
+    if s.get("glass") in ("off", "on", "lite"):
+        out["glass"] = s["glass"]
+    if isinstance(s.get("glass_icons"), bool):
+        out["glass_icons"] = s["glass_icons"]
+    if isinstance(s.get("moving_tiles"), bool):   # the focused tile's slow sway (#52)
+        out["moving_tiles"] = s["moving_tiles"]
+    if isinstance(s.get("lighter"), bool):   # lighter home for a slow box (#58)
+        out["lighter"] = s["lighter"]
+    if isinstance(s.get("glass_amount"), int) and not isinstance(s.get("glass_amount"), bool) and 1 <= s["glass_amount"] <= 5:
+        out["glass_amount"] = s["glass_amount"]
+    if s.get("clock_style") in ("frosted", "liquid"):
+        out["clock_style"] = s["clock_style"]
+    # Now playing on or off (#31), and the navigation sound: the TV's own, soft or off (#32)
+    if isinstance(s.get("now_playing"), bool):
+        out["now_playing"] = s["now_playing"]
+    if isinstance(s.get("ambient_music"), bool):
+        out["ambient_music"] = s["ambient_music"]
+    if isinstance(s.get("sun_sync"), bool):
+        out["sun_sync"] = s["sun_sync"]
+    if isinstance(s.get("ambient_weather"), bool):
+        out["ambient_weather"] = s["ambient_weather"]
+    if isinstance(s.get("ambient_sun_grade"), bool):
+        out["ambient_sun_grade"] = s["ambient_sun_grade"]
+    if s.get("nav_sound") in ("system", "soft", "off"):
+        out["nav_sound"] = s["nav_sound"]
+    if s.get("glass_focus") in ("colour", "glass"):   # glass app icons: the focused app (#32)
+        out["glass_focus"] = s["glass_focus"]
+    if isinstance(s.get("video"), bool):
+        out["video"] = s["video"]
+    # "" means the video link was removed on the TV (it then wins over home.video_url)
+    if isinstance(s.get("video_url"), str) and (s["video_url"] == "" or (re.match(r"https?://", s["video_url"]) and len(s["video_url"]) <= 2000)):
+        out["video_url"] = s["video_url"]
     for k in ("scene_order", "scenes_off"):
         ids = _ids(s.get(k))
         if ids is not None:
@@ -1194,7 +1612,7 @@ def clean_settings(s):
         out["clock"] = s["clock"]
     if isinstance(s.get("photos"), list):
         photos = []
-        for ph in s["photos"][:20]:
+        for ph in s["photos"][:MAX_PHOTOS]:
             if not isinstance(ph, dict) or not isinstance(ph.get("id"), str) or not 0 < len(ph["id"]) <= 32:
                 continue
             if isinstance(ph.get("file"), str) and _PHOTO_FILE.fullmatch(ph["file"]):
@@ -1206,6 +1624,10 @@ def clean_settings(s):
         out["hidden_apps"] = [x for x in dict.fromkeys(s["hidden_apps"]) if isinstance(x, str) and _PACKAGE.fullmatch(x)][:200]
     if isinstance(s.get("quick"), list):
         out["quick"] = [x for x in dict.fromkeys(s["quick"]) if x in config.QUICK_IDS]
+    sc = s.get("soundscape")
+    if isinstance(sc, dict) and sc.get("type") in config.SOUNDSCAPE_TYPES:
+        out["soundscape"] = {"type": sc["type"], "volume": config._float(sc.get("volume"), 0.5, 0.0, 1.0),
+                             "fade_with_sleep": sc.get("fade_with_sleep") is not False}
     return out
 
 
@@ -1254,10 +1676,13 @@ WATCH_NEXT_COLS = ["_id", "package_name", "title", "episode_title", "season_disp
                    "last_engagement_time_utc_millis", "last_playback_position_millis",
                    "duration_millis", "watch_next_type", "type", "browsable"]
 WATCH_NEXT_TYPES = {"0": "continue", "1": "next", "2": "new", "3": "watchlist"}
-continue_cache = {"items": [], "links": {}, "ts": 0.0}
 # Apps kept out of Keep watching (YouTube here: it can bury
 # everything else). The history is still recorded, it just is not listed.
 CONTINUE_SKIP = {"youtube"}
+# Never logged as watched at all: videos, music and streams are not shows to keep watching, and a
+# video title matched to a film would put that film in the household's taste (issue #23: a
+# Veritasium video logged as "Fear of Rain"). The on-TV app has the same list (Now.NOT_KEPT).
+NOT_KEPT = {"youtube", "spotify", "twitch", "moonlight"}
 
 
 def _parse_rows(out, cols):
@@ -1317,62 +1742,112 @@ async def watch_next():
     return items
 
 
-async def continue_items(who=None):
-    # Android's Watch Next rows are not readable over ADB on this TV (needs a system
-    # permission), so the list is our own history only. watch_next() stays for a TV that allows it.
-    out, links, seen = [], {}, set()
-    for it in continue_cache["items"]:
-        if it.get("service") in CONTINUE_SKIP:
+def continue_items(who=None):
+    """Keep watching for the person on the couch (or `who`) at this TV: one card per show, newest
+    first, up to 10, nothing older than 30 days. A card's id is its history line's own id."""
+    who = who or cur_who()
+    out = []
+    for h in store.keep_watching(_current.get(), who):
+        if h.get("service") in CONTINUE_SKIP:
             continue
-        links[it["id"]] = ("link", it["_link"], it.get("app"))
-        seen.add(it["title"].lower())
-        out.append({k: v for k, v in it.items() if k != "_link"})
-    for n, h in enumerate(store.continue_watching(who, limit=60)):
-        if h["title"].lower() in seen or h.get("service") in CONTINUE_SKIP:
-            continue
-        hid = f"h-{n}"
-        links[hid] = ("play", h, None)
         app = apps.BY_ID.get(h.get("service"))
-        out.append({"id": hid, "title": h["title"], "episode_title": None,
+        out.append({"id": h["id"], "title": h["title"], "episode_title": h.get("episode_title"),
                     "season": h.get("season"), "episode": h.get("episode"),
                     "app": apps.describe_package(app["package"]) if app else None,
                     "service": h.get("service"), "poster": h.get("poster"),
                     "backdrop": h.get("backdrop"), "progress": None, "kind": "continue",
-                    "last_played": h.get("last_played"), "source": "bridge"})
-    out.sort(key=lambda i: i.get("last_played") or "", reverse=True)
-    continue_cache["links"] = links
+                    "last_played": h.get("when"), "source": "bridge"})
     return out
+
+
+# ---------- now playing (#31): music any app is playing, for the home's card ----------
+# Read from the same `dumpsys media_session` as Keep watching, but not only the app in front: the
+# point is music (Spotify, YouTube Music) carrying on behind the home. A session counts while it
+# plays, and stays a while after a pause so the card's play button can start it again.
+MUSIC_PAUSE_KEEP = 600          # seconds a paused session stays on the card
+OWN_PACKAGES = {"app.couchtv.launcher", "dev.couchtv.ontv"}
+music_states = {}             # per TV: {"read_at", "item", "last"}
+music_art = {}                  # (artist, title) -> picture url or ""
+music_art_pending = set()
+
+
+async def _music_artwork(artist, title):
+    """The album picture from Apple's free iTunes search (no key), once per song."""
+    key = ((artist or "").lower(), (title or "").lower())
+    try:
+        import aiohttp
+        q = f"{artist or ''} {title or ''}".strip()
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as cs:
+            async with cs.get("https://itunes.apple.com/search", params={"term": q, "entity": "song", "limit": "1"},
+                              headers={"user-agent": "couch-tv-bridge/1"}) as r:
+                j = await r.json(content_type=None)
+        hit = (j.get("results") or [None])[0]
+        url = hit.get("artworkUrl100") if hit else None
+        music_art[key] = url.replace("100x100bb", "600x600bb") if url else ""
+    except Exception:
+        music_art[key] = ""
+    finally:
+        music_art_pending.discard(key)
+
+
+async def music_now():
+    """The song on the card: playing now, or paused in the last ten minutes. Cached for 3 s."""
+    music_state = music_states.setdefault(_current.get(), {"read_at": 0.0, "item": None, "last": None})
+    if time.time() - music_state["read_at"] < 3:
+        return music_state["item"]
+    music_state["read_at"] = time.time()
+    item = None
+    if tv.connected and tv.is_on and await tv.adb_ready():
+        try:
+            out = await tv.adb("shell", "cat /proc/uptime; dumpsys media_session", timeout=8)
+        except Exception:
+            return music_state["item"]   # ADB busy or away for a moment: keep the card as it was
+        found = [x for x in _sessions(out) if x.get("package") not in OWN_PACKAGES and x.get("title")]
+        playing = [x for x in found if x.get("state") == "PLAYING"]
+        playing.sort(key=lambda x: not x.get("active"))
+        last = music_state["last"]
+        pick = playing[0] if playing else None
+        if not pick and last and time.time() - last["seen"] < MUSIC_PAUSE_KEEP:
+            pick = next((x for x in found if x["package"] == last["package"] and x.get("state") in ("PAUSED", "STOPPED")), None)
+        if pick:
+            app = apps.describe_package(pick["package"]) or {"id": None, "name": pick["package"], "package": pick["package"]}
+            if not generic_title(pick["title"], pick["package"], app):
+                if pick.get("state") == "PLAYING":
+                    music_state["last"] = {"package": pick["package"], "seen": time.time()}
+                key = ((pick.get("subtitle") or "").lower(), pick["title"].lower())
+                if key not in music_art and key not in music_art_pending:
+                    music_art_pending.add(key)
+                    asyncio.ensure_future(_music_artwork(pick.get("subtitle"), pick["title"]))
+                item = {"title": pick["title"], "artist": pick.get("subtitle"), "album": pick.get("album"),
+                        "state": STATES.get(pick.get("state"), "stopped"), "app": app,
+                        "art": music_art.get(key) or None}
+                if pick.get("pos_s") is not None:
+                    item["position"] = pick["pos_s"]
+                if pick.get("dur_s") is not None:
+                    item["duration"] = pick["dur_s"]
+    music_state["item"] = item
+    return item
+
+
+async def h_music(request):
+    return ok(music=await music_now())
 
 
 async def h_continue(request):
     who = store.norm_who(request.query.get("who"))
-    return ok(items=await continue_items(who))
+    return ok(items=continue_items(who))
 
 
 async def h_continue_open(request):
     data = await body(request)
     cid = data.get("id")
-    if cid not in continue_cache["links"]:
-        await continue_items()
-    entry = continue_cache["links"].get(cid)
-    if not entry:
+    h = store.history_item(cid) if cid else None
+    if not h:
         raise ApiError(404, f"unknown continue item: {cid}")
-    kind, target, app = entry
-    if kind == "play":
-        result = await play(target["title"], target.get("season"), target.get("episode"),
-                            target.get("service"),
-                            store.norm_who(data.get("who")) or store.current_who(), resume=True)
-        record_action(request, "continue", {"id": cid}, True)
-        return ok(**result)
-    if not target:
-        if not app:
-            raise ApiError(409, "that item has no link to resume")
-        got, _ = await launch_app({"id": app["id"], "name": app["name"], "package": app["package"]})
-    else:
-        await tv.start_intent(target, app["package"] if app else None)
-        got = await tv.wait_for_app({app["package"]} if app else set(), timeout=8) if app else True
-    record_action(request, "continue", {"id": cid}, bool(got))
-    return ok(app=apps.describe_package(tv.current_package))
+    result = await play(h["title"], h.get("season"), h.get("episode"), h.get("service"),
+                        store.norm_who(data.get("who")) or cur_who(), resume=True)
+    record_action(request, "continue", {"id": cid}, True)
+    return ok(**result)
 
 
 # ---------- which episode, and how long (only when matched, never a guess) ----------
@@ -1451,11 +1926,16 @@ NOT_VIEWING = {"home", "settings", None}
 
 
 def _sessions(out):
-    """Pull package, state, position and title out of `cat /proc/uptime; dumpsys media_session`.
+    """Pull package, state, position, duration and title out of `cat /proc/uptime; dumpsys media_session`.
     PlaybackState `updated` is the TV's elapsed time since boot in ms, the same clock as the
     first number in /proc/uptime, so the position can be brought up to the moment of reading."""
     import re
     found, cur = [], None
+    try:
+        first_token = out.split()[0] if out else ""
+        uptime_ms = int(float(first_token) * 1000)
+    except (ValueError, IndexError):
+        uptime_ms = None
     for line in out.splitlines():
         line = line.strip()
         if line.startswith("package="):
@@ -1466,16 +1946,55 @@ def _sessions(out):
         elif line.startswith("state=PlaybackState") and cur is not None:
             m = re.search(r"\{state=([A-Z_]+)\(", line)
             cur["state"] = m.group(1) if m else None
+            if not m:   # older Android prints a number: PlaybackState {state=3, ...}
+                m = re.search(r"\{state=(\d+)[,}]", line)
+                n = int(m.group(1)) if m else -1
+                cur["state"] = STATE_NAMES[n] if 0 <= n < len(STATE_NAMES) else None
             for key in ("position", "updated"):
                 m = re.search(rf"[ {{]{key}=(-?\d+)", line)
                 cur[key] = int(m.group(1)) if m else None
             m = re.search(r"speed=([-\d.]+)", line)
             cur["speed"] = float(m.group(1)) if m else 0.0
-        elif line.startswith("metadata:") and "description=" in line and cur is not None:
-            parts = [p.strip() for p in line.split("description=", 1)[1].split(", ")]
-            cur["title"] = parts[0] if parts and parts[0] != "null" else None
-            cur["subtitle"] = parts[1] if len(parts) > 1 and parts[1] != "null" else None
+            pos = cur.get("position")
+            if pos is not None and pos >= 0:
+                if uptime_ms and cur.get("updated") and cur.get("state") == "PLAYING" and cur.get("speed", 0.0) > 0:
+                    pos = pos + int((uptime_ms - cur["updated"]) * cur["speed"])
+                cur["pos_s"] = round(pos / 1000.0, 1)
+        elif line.startswith("metadata:") and cur is not None:
+            if "description=" in line:
+                parts = [p.strip() for p in line.split("description=", 1)[1].split(", ")]
+                cur["title"] = parts[0] if parts and parts[0] != "null" else None
+                cur["subtitle"] = parts[1] if len(parts) > 1 and parts[1] != "null" else None
+                cur["album"] = parts[2] if len(parts) > 2 and parts[2] != "null" else None
+            m_dur = re.search(r"(?:duration|DURATION)=(\d+)", line)
+            if m_dur:
+                cur["duration"] = int(m_dur.group(1))
+                cur["dur_s"] = round(int(m_dur.group(1)) / 1000.0, 1)
+        elif cur is not None and ("duration" in line.lower() or "android.media.metadata.duration" in line.lower()):
+            m_dur = re.search(r"(?:duration|DURATION)=(\d+)", line)
+            if m_dur:
+                cur["duration"] = int(m_dur.group(1))
+                cur["dur_s"] = round(int(m_dur.group(1)) / 1000.0, 1)
+        elif line.startswith("queueTitle=") and cur is not None:
+            q = line.split("=", 1)[1].rsplit(", size=", 1)[0].strip()
+            cur["queue_title"] = q if q and q != "null" else None
     return found
+
+
+# What some apps report as the title while a film plays, or on their browse screen: their own
+# name ("PrimeVideo" on a Sony, issue #23) or a placeholder. Never a show to keep watching.
+GENERIC_TITLES = {"primevideo", "amazonprimevideo", "amazonvideo", "prime", "amazon", "netflix", "youtube", "disney",
+                  "advertisement", "ad", "ads", "sponsored", "trailer", "preview", "loading", "nowplaying",
+                  "unknown", "null", "untitled", "video", "tv", "live", "home"}
+
+
+def generic_title(title, pkg=None, app=None):
+    n = re.sub(r"[^a-z0-9]", "", (title or "").lower())
+    if not n or n in GENERIC_TITLES or n.isdigit():
+        return True
+    own = {re.sub(r"[^a-z0-9]", "", (x or "").lower())
+           for x in ((app or {}).get("name"), (app or {}).get("id"), pkg, (pkg or "").rsplit(".", 1)[-1])}
+    return n in own
 
 
 STATES = {"PLAYING": "playing", "PAUSED": "paused", "BUFFERING": "buffering",
@@ -1483,6 +2002,9 @@ STATES = {"PLAYING": "playing", "PAUSED": "paused", "BUFFERING": "buffering",
           "SKIPPING_TO_NEXT": "buffering", "SKIPPING_TO_PREVIOUS": "buffering",
           "SKIPPING_TO_QUEUE_ITEM": "buffering", "STOPPED": "stopped", "NONE": "stopped",
           "ERROR": "stopped"}
+# PlaybackState's numbers, for older Android that prints state=3 rather than state=PLAYING(3)
+STATE_NAMES = ("NONE", "STOPPED", "PAUSED", "PLAYING", "FAST_FORWARDING", "REWINDING", "BUFFERING",
+               "ERROR", "CONNECTING", "SKIPPING_TO_PREVIOUS", "SKIPPING_TO_NEXT", "SKIPPING_TO_QUEUE_ITEM")
 
 
 def _fallback_title(pkg):
@@ -1504,6 +2026,27 @@ def _fallback_title(pkg):
 
 
 art_cache = {}  # title -> {"poster", "backdrop"} from JustWatch
+art_pending = set()
+
+
+def artwork_soon(title):
+    """The picture if it is known now, else none, with the lookup started in the background. The
+    watch loop uses this, so a slow show finder never holds it up past the minute a show needs."""
+    key = (title or "").lower()
+    if not key:
+        return {}
+    if key in art_cache:
+        return art_cache[key]
+    if key not in art_pending:
+        art_pending.add(key)
+
+        async def fetch():
+            try:
+                await artwork(title)
+            finally:
+                art_pending.discard(key)
+        asyncio.ensure_future(fetch())
+    return {}
 
 
 async def artwork(title):
@@ -1519,7 +2062,8 @@ async def artwork(title):
         else:
             try:
                 best, _ = await finder.find(title)
-                if best:
+                # a near name is another show: no picture beats the wrong one
+                if best and finder._norm(best["title"]) == finder._norm(title):
                     art_cache[key] = {"poster": best["poster"], "backdrop": best["backdrop"]}
             except Exception:
                 pass
@@ -1546,6 +2090,11 @@ async def media_read(pkg, app):
     if pos is not None and pos < 0:
         pos = None
     title, episode_title, source_title = s.get("title"), s.get("subtitle"), "app"
+    if generic_title(title, pkg, app):   # "PrimeVideo" while a film plays: try the queue's title
+        title = s.get("queue_title") if not generic_title(s.get("queue_title"), pkg, app) else None
+        if not title:
+            episode_title = None
+    s["title"] = title
     ep = {}
     if title:
         ep = await resolve_episode(title, episode_title)
@@ -1557,7 +2106,7 @@ async def media_read(pkg, app):
     else:
         title, episode_title = _fallback_title(pkg)
         source_title = "bridge" if title else None
-    art = await artwork(title)
+    art = artwork_soon(title)
     new = {"title": title, "episode_title": ep.get("episode_title") or episode_title,
            "season": ep.get("season"), "episode": ep.get("episode"), "package": pkg,
            "state": state, "poster": art.get("poster"), "backdrop": art.get("backdrop"),
@@ -1579,6 +2128,23 @@ async def media_read(pkg, app):
     return s
 
 
+# A title counts as watched (Keep watching) once it has played this long, so a trailer that
+# autoplays while browsing stays out. COUCHTV_SEEN_AFTER_S lowers it for the emulator tests.
+SEEN_AFTER_S = float(os.environ.get("COUCHTV_SEEN_AFTER_S") or 60)
+
+
+def _blip(cand):
+    """A show is being counted: up to two readings in a row with nothing playing (a slow dumpsys, the
+    front app read as the home for a moment), within 40 s of the last reading that showed it, are
+    forgiven, as the on-TV app does (Now.remember). Only a different title, or nothing for longer,
+    starts it again. Counted here, so call it once per reading."""
+    if not (cand and cand[0]) or seen_playing.get("_empty_reads", 0) >= 2 \
+            or time.time() - seen_playing.get("_playing_last", 0) >= 40:
+        return False
+    seen_playing["_empty_reads"] = seen_playing.get("_empty_reads", 0) + 1
+    return True
+
+
 async def media_watch_loop():
     """Every 8 s while an app is in front (checks every 10 s otherwise): read what it says is playing, for
     /api/now (title, state, position) and to log shows started by hand."""
@@ -1595,44 +2161,224 @@ async def media_watch_loop():
                     and await tv.adb_ready()):
                 busy = True
                 s = await media_read(pkg, app)
-                if s and s.get("state") == "PLAYING" and s.get("title"):
-                    key = (pkg, s["title"].lower())
+                key = (pkg, s["title"].lower()) if s and s.get("state") == "PLAYING" and s.get("title") else None
+                # the app's own position has to be past the minute too, when it gives one: a preview
+                # that autoplays on a browse screen starts at 0 each time
+                pos = media_now.get("position_ms")
+                young = pos is not None and pos < SEEN_AFTER_S * 1000
+                cand = seen_playing.get("_playing")
+                if key:
+                    seen_playing["_empty_reads"] = 0
+                if key and key == (cand and cand[0]):
+                    seen_playing["_playing_last"] = time.time()
+                if key is None and _blip(cand):
+                    pass   # one reading with nothing playing does not start the minute again
+                elif key != (cand and cand[0]):
+                    seen_playing["_playing"] = (key, time.time())   # something new (or nothing) playing
+                    seen_playing["_playing_last"] = time.time()
+                elif key and not young and time.time() - cand[1] >= SEEN_AFTER_S and time.time() - seen_playing.get(key + (cur_who(),), 0) >= 1800:
+                    seen_playing[key + (cur_who(),)] = time.time()
                     item = playing["item"]
-                    if time.time() - seen_playing.get(key, 0) >= 1800:
-                        seen_playing[key] = time.time()
-                        # Our own /api/play already logged it if it is the same show.
-                        if not (item and item["title"].lower() in
-                                (s["title"].lower(), (s.get("subtitle") or "").lower())):
-                            await log_seen(s["title"], s.get("subtitle"), app)
-            elif media_now:
-                media_now.clear()
-                push_now()
+                    # Our own /api/play already logged it if it is the same show, for the same person,
+                    # in the last three hours.
+                    if not (item and item.get("who") == cur_who() and item.get("ts", 0) > time.time() - 3 * 3600
+                            and item["title"].lower() in (s["title"].lower(), (s.get("subtitle") or "").lower())):
+                        await log_seen(s["title"], s.get("subtitle"), app, dict(media_now))
+                untitled_step(pkg, app, bool(s and s.get("state") == "PLAYING" and not s.get("title")), pos,
+                              titled=bool(s and s.get("state") == "PLAYING" and s.get("title")))
+            else:
+                if not _blip(seen_playing.get("_playing")):
+                    seen_playing["_playing"] = (None, time.time())   # the minute starts again after a break
+                untitled_step(None, None, False, None)
+                if media_now and not getattr(tv, "native_media", False):   # a Roku fills media_now itself
+                    media_now.clear()
+                    push_now()
+            await untitled_resolve()
         except Exception as e:
             log.warning("media watch skipped: %s: %s", type(e).__name__, e)
         await asyncio.sleep(8 if busy else 10)
 
 
-async def log_seen(title, subtitle, app):
+UNTITLED_KEEP_S = 3 * 3600   # how long after an untitled play its Watch Next row may still turn up
+OPENED_WINDOW_S = 600        # a show couch-tv opened this long before the play started covers it
+
+
+def untitled_step(pkg, app, untitled, pos, titled=False):
+    """Netflix sends no title while it plays and Prime only its own name (issue #23), so there is
+    nothing to log. Remember such a play here, per TV and with the person on the couch, once it has
+    played continuously for the minute (and, when the app gives a position, past the minute too).
+    untitled_resolve() then names it from Android's Watch Next row for that app."""
+    now = time.time()
+    u = seen_playing.get("_untitled")
+    if not untitled or not app or app["id"] in NOT_KEPT:
+        # a break before the minute starts it again; and once the same app names what it plays, a
+        # later Watch Next row would be that show, not the earlier unnamed one
+        if u and not u["done"] and ((not u["qualified"] and now - u["last"] >= 40) or (titled and pkg == u["pkg"])):
+            seen_playing["_untitled"] = None
+        return
+    if not u or u["pkg"] != pkg or u["who"] != cur_who() or (u["done"] and now - u["last"] > 600):
+        u = {"pkg": pkg, "app": app, "who": cur_who(), "since": now, "last": now,
+             "qualified": False, "done": False}
+        # A show couch-tv itself opened in this app just before (phone search, Ask, a Keep
+        # watching card) was logged when it was opened (play()): that already names this play.
+        item = playing["item"]
+        if (item and item.get("package") == pkg and item.get("who") == cur_who()
+                and now - OPENED_WINDOW_S <= item.get("ts", 0) <= now + 60):
+            u["done"], u["named_by"] = True, "opened"
+    u["last"] = now
+    if (not u["qualified"] and now - u["since"] >= SEEN_AFTER_S
+            and (pos is None or pos >= SEEN_AFTER_S * 1000)):
+        u["qualified"] = True
+        log.info("untitled play counted in %s for %s: looking for its Watch Next row",
+                 app["name"], u["who"] or "nobody")
+    seen_playing["_untitled"] = u
+
+
+def _wn_rows():
+    """Watch Next rows for this TV: from the TV home app (POST /api/watch-next; the launcher holds
+    READ_TV_LISTINGS, ADB's shell user cannot read other apps' rows) and from ADB where a TV allows it."""
+    return list(seen_playing.get("_wn_rows") or [])
+
+
+def wn_report(rows, u, now):
+    """What the Watch Next matcher is looking at, for the log line and GET /api/watch-next: how many
+    rows the home sent, from which apps, and for the app being played how each row failed the match
+    (no engagement time, older than the play, or a title that is just the app's name)."""
+    pkgs = {}
+    for r in rows:
+        pkgs[r.get("package")] = pkgs.get(r.get("package"), 0) + 1
+    mine = []
+    for r in rows:
+        if u and r.get("package") == u["pkg"]:
+            eng = r.get("engaged")
+            if not eng:
+                why = "no engagement time"
+            elif eng < u["since"] - 120:
+                why = f"engaged {round(u['since'] - eng)} s before the play started"
+            elif generic_title(r.get("title"), u["pkg"], u["app"]):
+                why = "title is only the app's name"
+            else:
+                why = "matches"
+            mine.append({"title": r.get("title"), "engaged": eng, "why": why})
+    return {"rows": len(rows), "apps": pkgs, "for_this_app": mine}
+
+
+def _why_no_row(u, rows, now):
+    """One log line a minute while an untitled play still has no Watch Next row, so a TV where it
+    never arrives (couch-tv#23, Netflix on an Android 11 Xiaomi) says why instead of staying quiet."""
+    if now - u.get("logged_at", 0) < 60:
+        return
+    u["logged_at"] = now
+    rep = wn_report(rows, u, now)
+    log.info("untitled play in %s: no Watch Next row yet. The home sent %d rows from %d apps, %d for this app%s",
+             u["app"]["name"], rep["rows"], len(rep["apps"]), len(rep["for_this_app"]),
+             "".join(f"; '{m['title']}': {m['why']}" for m in rep["for_this_app"][:3]))
+
+
+async def untitled_resolve():
+    u = seen_playing.get("_untitled")
+    if not u or u["done"] or not u["qualified"]:
+        return
+    now = time.time()
+    if now - u["last"] > UNTITLED_KEEP_S:
+        seen_playing["_untitled"] = None
+        return
+    rows = _wn_rows()
+    if now - seen_playing.get("_wn_adb_at", 0) > 60 and tv.connected and await tv.adb_ready():
+        seen_playing["_wn_adb_at"] = now
+        try:
+            for it in await watch_next():
+                pkg = (it.get("app") or {}).get("package")
+                when = it.get("last_played")
+                rows.append({"package": pkg, "title": it.get("title"), "episode_title": it.get("episode_title"),
+                             "season": it.get("season"), "episode": it.get("episode"),
+                             "poster": it.get("poster"),
+                             "engaged": datetime.fromisoformat(when).timestamp() if when else None})
+        except Exception:
+            pass
+    best = None
+    for r in rows:
+        if (r.get("package") == u["pkg"] and r.get("engaged") and r["engaged"] >= u["since"] - 120
+                and not generic_title(r.get("title"), u["pkg"], u["app"])):
+            if not best or r["engaged"] > best["engaged"]:
+                best = r
+    if not best:
+        _why_no_row(u, rows, now)
+        return
+    u["done"], u["named_by"] = True, "watch-next"
+    seen_playing["_untitled"] = u
+    poster = best.get("poster") if str(best.get("poster") or "").startswith("https://") else None
+    await log_seen(best["title"], best.get("episode_title"), u["app"],
+                   {"season": best.get("season"), "episode": best.get("episode"),
+                    "episode_title": best.get("episode_title")},
+                   who=u["who"], method="watch-next", poster=poster)
+
+
+async def h_watch_next(request):
+    """The TV home app's copy of Android's Watch Next rows (it can read them, ADB cannot)."""
+    data = await body(request)
+    rows = []
+    for r in (data.get("rows") or [])[:40]:
+        if not isinstance(r, dict) or not isinstance(r.get("title"), str) or not isinstance(r.get("package"), str):
+            continue
+        try:
+            engaged = float(r.get("engaged") or 0) / 1000 or None
+        except (TypeError, ValueError):
+            engaged = None
+        rows.append({"package": r["package"][:200], "title": r["title"][:200],
+                     "episode_title": (r.get("episode_title") or None) and str(r["episode_title"])[:200],
+                     "season": str(r.get("season") or "")[:6] or None, "episode": str(r.get("episode") or "")[:6] or None,
+                     "poster": None, "engaged": engaged})
+    seen_playing["_wn_rows"] = rows
+    seen_playing["_wn_at"] = time.time()
+    await untitled_resolve()
+    return ok(rows=len(rows))
+
+
+async def h_watch_next_get(request):
+    """What the home last sent, and how the matcher sees it, for finding out why an app's play never
+    gets named (couch-tv#23). Read only."""
+    u = seen_playing.get("_untitled")
+    rows = _wn_rows()
+    at = seen_playing.get("_wn_at")
+    return ok(received_s_ago=round(time.time() - at) if at else None,
+              untitled=None if not u else {"package": u["pkg"], "qualified": u["qualified"], "done": u["done"],
+                                           "named_by": u.get("named_by"),
+                                           "started_s_ago": round(time.time() - u["since"])},
+              report=wn_report(rows, u, time.time()),
+              rows=rows)
+
+
+async def log_seen(title, subtitle, app, now=None, who=None, method="seen", poster=None):
+    """Log a show seen playing, with the season and episode media_read worked out (`now`, a copy of
+    media_now), on this TV for the person on the couch here (or `who`, the person picked when it
+    played). Only a show of the same name gets the finder's title and picture; a near miss keeps the
+    app's own title and no picture. Videos and music are never logged (NOT_KEPT)."""
+    if app.get("id") in NOT_KEPT:
+        return
+    now = now or {}
+    fallback_poster = poster
     poster = backdrop = year = kind = None
     show = title
     try:
+        names = [finder._norm(title)] + ([finder._norm(subtitle)] if subtitle else [])
         best, _ = await finder.find(title)
-        # an exact name match on either field wins over a near miss on the first one
-        if subtitle and (not best or finder._norm(best["title"]) != finder._norm(title)):
+        if subtitle and (not best or finder._norm(best["title"]) not in names):
             alt, _ = await finder.find(subtitle)
-            if alt and (not best or finder._norm(alt["title"]) == finder._norm(subtitle)):
+            if alt and finder._norm(alt["title"]) in names:
                 best = alt
-        if best:
+        if best and finder._norm(best["title"]) in names:
             show, poster, backdrop, year, kind = (best["title"], best["poster"], best["backdrop"],
                                                   best["year"], best["type"])
     except Exception:
         pass
-    store.add_history({"title": show, "year": year, "type": kind, "poster": poster,
+    store.add_history({"title": show, "year": year, "type": kind, "poster": poster or fallback_poster,
                        "backdrop": backdrop, "service": app["id"] or app["package"],
-                       "who": store.current_who(),
-                       "season": None, "episode": None, "episode_title": subtitle,
-                       "when": now_iso(), "method": "seen"})
-    log.info("logged %s on %s", show, app["name"])
+                       "who": who if who is not None else cur_who(), "tv": _current.get(),
+                       "season": now.get("season"), "episode": now.get("episode"),
+                       "episode_title": now.get("episode_title") or subtitle,
+                       "when": now_iso(), "method": method})
+    log.info("logged %s on %s (%s)", show, app["name"], method)
 
 
 # ---------- picture mode: a switch between the TV's two modes in picture.modes ----------
@@ -1697,6 +2443,25 @@ async def h_picture_set(request):
                 break
     record_action(request, "picture", {"mode": want}, True)
     return ok(mode=picture_state.get("mode"), can_set=True)
+
+
+async def h_bluetooth_audio_get(request):
+    supported = hasattr(tv, "open_bluetooth_settings") and bool(await tv.adb_ready())
+    return ok(supported=supported)
+
+
+async def h_bluetooth_audio_set(request):
+    tv.require()
+    if not hasattr(tv, "open_bluetooth_settings"):
+        raise ApiError(409, f"Bluetooth screen is not supported on this {tv.name} TV")
+    try:
+        await tv.open_bluetooth_settings()
+        record_action(request, "bluetooth_audio", {"action": "open_settings"}, True)
+        return ok()
+    except TVUnavailable as e:
+        raise ApiError(503, str(e))
+    except Exception as e:
+        raise ApiError(500, f"could not open Bluetooth settings: {e}")
 
 
 async def set_picture(mode):
@@ -1833,24 +2598,45 @@ async def h_taste(request):
 # ---------- keep the stock home screen off ----------
 
 
+# Never switched off by the guard, even when an old keep-disabled file lists them: couch-tv 0.10 and
+# older wrote the TV's own homes and the setup wizard there, and with them off some Google TVs loop
+# at power on (README, "If your TV loops after a restart").
+NEVER_DISABLE = {"com.google.android.apps.tv.launcherx", "com.google.android.tvlauncher",
+                 "com.google.android.tungsten.setupwraith"}
+
+
+stock_home_done = set()
+
+
 async def keep_disabled_loop():
     """Daily, per TV: re-disable packages listed in that TV's keep-disabled file (the living
-    room's is data/keep-disabled.json, written by apply.sh when it switches the Google home screen
-    off). A Google TV update can switch them back on. If the TV is off, try again hourly."""
+    room's is data/keep-disabled.json, written by apply.sh: ambient mode and any ad tracker). A
+    Google TV update can switch them back on. If the TV is off, try again hourly. The TV's own home
+    screens and setup wizard are never switched off (NEVER_DISABLE)."""
     await asyncio.sleep(60)
     while True:
         done = False
         path = os.path.join(HERE, tv.keep_disabled_file or "")
         try:
             with open(path) as f:
-                packages = json.load(f)
-        except (FileNotFoundError, IsADirectoryError, json.JSONDecodeError):
-            packages = []
-        if not packages:
+                listed = json.load(f)
+            packages = [p for p in listed if p not in NEVER_DISABLE]
+            to_enable = [p for p in listed if p in NEVER_DISABLE]   # only what couch-tv's own file says it switched off
+        except (FileNotFoundError, IsADirectoryError, json.JSONDecodeError, TypeError):
+            packages, to_enable = [], []
+        if not packages and not to_enable:
             done = True
         elif tv.paired and await tv.adb_ready():
             try:
                 disabled = await tv.adb("shell", "pm", "list", "packages", "-d")
+                # One time, per TV: couch-tv 0.10 and older switched the TV's own homes and setup
+                # wizard off (that is the boot loop). Switch back on any that are installed and off.
+                if tv.id not in stock_home_done:
+                    for pkg in to_enable:
+                        if f"package:{pkg}" in disabled.split():
+                            await tv.adb("shell", "pm", "enable", pkg)
+                            log.warning("%s: switched %s back on (couch-tv 0.10 and older had switched it off)", tv.id, pkg)
+                    stock_home_done.add(tv.id)
                 for pkg in packages:
                     if f"package:{pkg}" not in disabled.split():
                         await tv.adb("shell", "pm", "disable-user", "--user", "0", pkg)
@@ -1866,6 +2652,38 @@ def _maybe_refresh_installed():
         asyncio.ensure_future(installed_packages(wait=False))
 
 
+# ---------- close apps when the TV turns off ----------
+# Some apps refresh their sign-in the moment the TV wakes, before its Wi-Fi is back, and sign out
+# when that fails (Disney+ 26.20, November 2026: the network returned 1 s after it gave up). Apps
+# listed in "close_on_off" for a TV in config.json are force-stopped when that TV turns off, so
+# the next time they open they start fresh, with the network already up.
+_last_on = {}
+
+
+def _close_on_off():
+    t = TVS[_current.get()]
+    on, was = t.is_on, _last_on.get(t.id)
+    if on is not None:
+        _last_on[t.id] = on
+    if was is True and on is False and t.kind == "android":
+        cfg = next((c for c in config.TVS if c["id"] == t.id), {})
+        packages = [p for p in cfg.get("close_on_off") or [] if isinstance(p, str) and p]
+        if packages:
+            asyncio.ensure_future(_force_stop(t, packages))
+
+
+async def _force_stop(t, packages):
+    try:
+        if not (t.paired and await t.adb_ready()):
+            log.info("%s: turned off, could not reach ADB to close %s", t.id, ", ".join(packages))
+            return
+        for pkg in packages:
+            await t.adb("shell", "am", "force-stop", pkg)
+        log.info("%s: turned off, closed %s", t.id, ", ".join(packages))
+    except Exception as e:
+        log.warning("%s: closing apps on turn off failed: %s", t.id, e)
+
+
 async def h_tvs(request):
     out = []
     for tv_id, t in TVS.items():
@@ -1874,6 +2692,10 @@ async def h_tvs(request):
                "connected": t.connected, "adb": t.adb_ok, "power": "unknown" if on is None else ("on" if on else "off")}
         if t.kind == "samsung":
             row |= {"art_mode": t.art_mode, "hook": [f"{w} {what}" for w, what in t.hook_log]}
+        elif t.kind == "lg":
+            row |= {"devmode": t.devmode_status(), "hook": [f"{w} {what}" for w, what in t.hook_log]}
+        elif t.kind == "roku":
+            row |= {"ecp": t.ecp_status(), "hook": [f"{w} {what}" for w, what in t.hook_log]}
         out.append(row)
     return ok(default=DEFAULT_TV, tvs=out)
 
@@ -1883,10 +2705,13 @@ def make_app():
     app = web.Application(middlewares=[middleware])
     r = app.router
     r.add_get("/api/health", h_health)
+    r.add_post("/api/pair", h_pair)
+    r.add_get("/bridge/shim.js", h_bridge_shim)
     r.add_get("/api/tvs", h_tvs)
     r.add_get("/api/now", h_now)
     r.add_get("/api/events", h_events)
     r.add_post("/api/key", h_key)
+    r.add_post("/api/pointer", h_pointer)
     r.add_post("/api/text", h_text)
     r.add_get("/api/apps", h_apps)
     r.add_post("/api/launch", h_launch)
@@ -1895,12 +2720,17 @@ def make_app():
     r.add_post("/api/ask", h_ask)
     r.add_get("/api/tizen/next", h_tizen_next)
     r.add_post("/api/tizen/answer", h_tizen_answer)
+    r.add_get("/api/webos/apps", h_webos_apps)
+    r.add_get("/api/roku/apps", h_roku_apps)
+    r.add_get("/api/roku/icon/{id}", h_roku_icon)
     r.add_get("/api/recs", h_recs)
     r.add_get("/api/history", h_history)
     r.add_get("/api/taste", h_taste)
     r.add_post("/api/import", h_import)
     r.add_get("/api/picture", h_picture_get)
     r.add_post("/api/picture", h_picture_set)
+    r.add_get("/api/bluetooth-audio", h_bluetooth_audio_get)
+    r.add_post("/api/bluetooth-audio", h_bluetooth_audio_set)
     r.add_get("/api/people", h_people_get)
     r.add_post("/api/people", h_people_set)
     r.add_get("/api/who", h_who_get)
@@ -1913,7 +2743,10 @@ def make_app():
     r.add_get("/api/settings", h_settings_get)
     r.add_post("/api/settings", h_settings_set)
     r.add_get("/api/continue", h_continue)
+    r.add_get("/api/music", h_music)
     r.add_post("/api/continue/open", h_continue_open)
+    r.add_post("/api/watch-next", h_watch_next)
+    r.add_get("/api/watch-next", h_watch_next_get)
     r.add_get("/api/sleep", h_sleep_get)
     r.add_post("/api/sleep", h_sleep_set)
     r.add_get("/api/screens", h_screens)
@@ -1937,6 +2770,7 @@ def make_app():
         for tv_id, t in TVS.items():
             t.on_change(lambda tv_id=tv_id: with_tv(tv_id, push_now))
             t.on_change(lambda tv_id=tv_id: with_tv(tv_id, _maybe_refresh_installed))
+            t.on_change(lambda tv_id=tv_id: with_tv(tv_id, _close_on_off))
             ends = store.sleep_ends(tv_id)
             if ends and datetime.fromisoformat(ends).timestamp() > time.time():
                 with_tv(tv_id, _sleep_set, ends)

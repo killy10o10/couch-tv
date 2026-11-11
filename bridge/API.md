@@ -13,8 +13,12 @@ changes, the change is written here first, with a dated note at the bottom.
 | TV home screen | `/tv/` serves `tv-home/web/` |
 | API | everything under `/api/` |
 
-- Plain HTTP on the home network. No password (home network only). Never put the bridge on the internet.
-- CORS is open (`Access-Control-Allow-Origin: *`), so you can develop against it from another port.
+- Plain HTTP on the home network. Never put the bridge on the internet or forward a router port to it.
+- Optional pairing key: set `"pairing_key"` under `"bridge"` in `config.json`. When enabled, protected endpoints require `Authorization: Bearer <key>`, `X-API-Key: <key>`, or `?token=<key>`. Wrong keys are limited on every endpoint, `/api/pair` included: after 5 different wrong keys from one address within 60 seconds, that address gets `429` for the rest of the minute. The same wrong key repeated counts once, and the bridge computer itself (loopback) is never limited. `X-Forwarded-For` is ignored.
+- DNS rebinding: a request whose `Host` is a name the bridge does not know gets `403`. Any IP address, any `.local` name, `localhost`, `bridge.host` and `bridge.fallback_hosts` are known; a request with no `Host` header (a script) passes.
+- CORS is restricted to the bridge's own origin, local dev origins (5173), and the TV homes' origins (`null`, `file://`, `home.tvos.invalid`). A page served by the bridge under the address the request went to counts as the bridge's own origin. Requests from any other origin get `403` and never reach a handler.
+- **Why "null" in the origin list matters:** TV apps (Android WebView, webOS, Tizen) load from local files and send `Origin: null`. Browsers also send `Origin: null` for requests from sandboxed `<iframe>` elements. Because of this browser behavior, an origin allowlist alone cannot block a malicious web page from sending `Origin: null` requests. The pairing key (`pairing_key`) is what truly protects the bridge from malicious cross-origin requests.
+- POST requests with a body must send `Content-Type: application/json` (otherwise rejected with `415`).
 - Use **relative URLs** (`/api/now`) in both front ends. Then they work from any device at home.
 - Static files are sent with `Cache-Control: no-cache`, so a rebuild shows on the next load.
 - Unknown paths under `/` and `/tv/` fall back to that folder's `index.html` (single page apps work).
@@ -36,8 +40,9 @@ The bridge can run more than one TV. Every endpoint takes an optional TV id:
 - Leave it out and you get the default TV (`default_tv` in `config.json`). Nothing changes for clients
   that never send it.
 - TV ids are the `id` values in the `tvs` list in `config.json`. A TV that is not paired gives `503` "not paired yet".
-- `/api/events?tv=<id>` streams that TV. `who`, watch history, keep watching and picks are
-  shared by the household, not per TV; `playing`, `sleep` and `power` are per TV.
+- `/api/events?tv=<id>` streams that TV. `who` (the person on that TV's couch), keep watching,
+  `playing`, `sleep` and `power` are per TV; the watch history file and the picks are shared by
+  the household.
 
 ### `GET /api/tvs`
 ```json
@@ -49,13 +54,27 @@ The bridge can run more than one TV. Every endpoint takes an optional TV id:
 ]}
 ```
 
+A Roku (`"kind": "roku"`) also has `ecp` and `hook`: `{"ecp": {"limited": false, "message": null}, "hook": ["13:02:11 TV came on, opened couch-tv"]}`.
+`ecp.limited` is `true` when the Roku answered a command with 403, which means its "Control by mobile apps"
+setting is limiting remote control; `message` then says where to change it (docs/ROKU.md).
+
 ## Endpoints
 
 ### `GET /api/health`
+Open without authentication. Reports bridge and TV connectivity, and whether the bridge requires a pairing key (`auth: "ok"` or `"required"`):
 ```json
-{"ok": true, "tv_connected": true, "adb": false, "version": "1"}
+{"ok": true, "tv_connected": true, "adb": false, "version": "1", "auth": "ok", "paired": true}
 ```
 `adb` tells you if the ADB features (screenshot, deep links that need it) are switched on.
+
+### `POST /api/pair`
+Pair a phone remote or client with the bridge when `pairing_key` is set in `config.json`.
+Open without authentication.
+Request: `{"key": "<pairing_key>"}`
+```json
+{"ok": true, "paired": true, "token": "<key>", "note": "paired"}
+```
+Wrong key gives HTTP 401: `{"ok": false, "error": "That pairing key is not right. Check config.json."}`.
 
 ### `GET /api/now`
 What is on the TV right now.
@@ -120,12 +139,32 @@ Who is on the couch right now. The TV home and the phone send it when someone sw
 ```json
 {"ok": true, "who": "person2"}
 ```
-- It is also in `/api/now` and the events stream as `who` (`null` until someone sets it).
+- Each TV keeps its own (`?tv=` or `"tv"` in the body); the TV home sends its person when it
+  starts. It is also in `/api/now` and the events stream as `who` (`null` until someone sets it).
 - It is used whenever a request has no `who` of its own: `/api/play`, `/api/ask`,
   `/api/continue/open`, and shows started by hand on the TV (logged from the app's own
-  "now playing"). So once a person is set, what they start lands in their keep watching.
-- `both` still means everyone: `GET /api/continue?who=both` shows everything.
-- Plays logged before this existed, or with nobody set, count as shared (they show for both).
+  "now playing"). So once a person is set, what they start on that TV lands in their keep watching.
+- `both` is the household with no people set up: its own row, like a person.
+
+### `POST /api/watch-next`
+The TV home app's copy of Android's Watch Next rows ("Continue watching"), sent each time the home
+refreshes. The launcher holds READ_TV_LISTINGS (`apply.sh` grants it); ADB's shell user cannot read
+other apps' rows. When an app plays for a minute with no title of its own (Netflix sends none on
+some TVs, Prime only "PrimeVideo"), the newest row for that app written after the play started names
+it in Keep watching, for the person picked when it played, up to 3 hours later.
+```json
+{"tv": "living-room", "rows": [{"package": "com.netflix.ninja", "title": "The Night Agent",
+  "episode_title": "Pilot", "season": "1", "episode": "1", "engaged": 1794100000000}]}
+```
+`engaged` is the row's last engagement time in milliseconds. Answers `{"ok": true, "rows": 1}`.
+
+### `GET /api/watch-next`
+Read only, for finding out why a play never gets named (issue #23). Returns the rows the home last
+sent (`rows`, `received_s_ago`), the untitled play being waited on (`untitled`: its package, whether
+it has counted, how long ago it started) and `report`: how many rows from which apps, and for the
+app being played how each of its rows fails the match (`no engagement time`, `engaged N s before the
+play started`, `title is only the app's name`, or `matches`). The bridge log says the same once a
+minute while a play is still waiting.
 
 ### `GET /api/people` and `POST /api/people`
 The people (profiles), in the order the TV and the phone show them. Any number, up to 12, and none
@@ -160,7 +199,7 @@ copy. All keys are explained in `docs/CONFIG.md`.
  "default_tv": "living-room", "ask": {"enabled": true}, "phone_remote": true}
 ```
 `tvs[].quick` is the quick buttons for that TV, in order: any of `sleep`, `picture`, `look`,
-`input`. `picture_modes` is the two mode names for the picture button (empty without a `picture`
+`soundscape`, `input`. `picture_modes` is the two mode names for the picture button (empty without a `picture`
 entry). The home itself hides a button that cannot work at the moment.
 
 ### `GET /api/events`
@@ -168,6 +207,14 @@ Server-sent events (`text/event-stream`). Open it with `new EventSource('/api/ev
 Each message is `event: now` with the same JSON as `GET /api/now`. Sent once on connect, then
 on every change (app, power, volume, connection). A comment line is sent every 20 s to keep it
 open. Use this instead of polling.
+
+### `POST /api/pointer`
+LG only: the TV's pointer (the Magic Remote's cursor), as the phone's touchpad drives it.
+```json
+{"dx": 12, "dy": -4}
+```
+moves it by that many pixels; `{"click": true}` clicks where it is; `{"scroll": 40}` scrolls.
+They can be combined in one request. Each value is clamped to ±400. Other TVs answer 400.
 
 ### `POST /api/key`
 ```json
@@ -218,6 +265,17 @@ the known set.
 Known ids: `netflix` `youtube` `stan` `binge` `abc-iview` `sbs-on-demand` `disney-plus`
 `prime-video` `kayo` `foxtel-go` `9now` `7plus` `10play` `spotify` `plex` `moonlight`
 `settings` `home`. `installed` is `null` when the bridge cannot tell yet.
+
+### `GET /api/roku/apps` and `GET /api/roku/icon/<id>`
+Roku only (`400` for any other TV, `503` while the Roku is not answering). The couch-tv channel on the Roku
+asks here for its apps, because a Roku channel may not read the list itself. The Roku's channels in the
+order arranged from the phone, known apps first, then by name; `package` is the Android style package where
+couch-tv knows the app and `roku.<id>` where it does not (open either with `POST /api/launch`).
+```json
+{"ok": true, "apps": [{"id": "12", "title": "Netflix", "package": "com.netflix.ninja", "icon": "/api/roku/icon/12"}]}
+```
+`/api/roku/icon/<id>` is the Roku's own icon for that channel (from its `query/icon`), kept in memory.
+`404` when the Roku has none or refuses it (newer Roku OS needs "Control by mobile apps" on Enabled).
 
 ### `POST /api/launch`
 ```json
@@ -334,13 +392,25 @@ Claude's picks plus continue watching. Optional `?who=person1`. Fast: it returns
 `picks` can be empty on day one (no watch history yet). Play a pick with `POST /api/play` and its
 `title` (and `service` if you have it).
 
+### `GET /api/music`
+Now playing (#31): the song any app on that TV (`?tv=`) is playing, from its media sessions, for the
+home's card and ambient music art screen. A song stays for ten minutes after a pause. `art` is the cover from Apple's free iTunes
+search, or `null` until it is found. `position` and `duration` (in seconds) are included when reported by the media session. `music` is `null` when nothing is playing. The card's buttons
+are `POST /api/key` with `previous`, `play_pause` and `next`.
+```json
+{"ok": true, "music": {"title": "Golden Hour", "artist": "JVKE", "album": "this is what ____ feels like",
+ "state": "playing", "app": {"id": "spotify", "name": "Spotify", "package": "com.spotify.tv.android"},
+ "art": "https://is1-ssl.mzstatic.com/.../600x600bb.jpg", "position": 42.5, "duration": 215.0}}
+```
+
 ### `GET /api/continue`
-"Keep watching": the shows to carry on with, newest first. Optional `?who=`.
+"Keep watching" for one TV (`?tv=`) and one person (`?who=`, else the person on that TV's couch):
+one card per show (its latest episode), newest first, at most 10, nothing older than 30 days.
 ```json
 {
   "ok": true,
   "items": [
-    {"id": "h-0", "title": "Bluey", "episode_title": "Hammerbarn", "season": 3, "episode": 4,
+    {"id": "3f2a9c1e0b7d4a55", "title": "Bluey", "episode_title": "Hammerbarn", "season": 3, "episode": 4,
      "app": {"id": "abc-iview", "name": "ABC iview", "package": "au.net.abc.iview"},
      "service": "abc-iview", "poster": "https://...jpg", "backdrop": "https://...jpg",
      "progress": null, "kind": "continue", "last_played": "2030-01-01T19:31:00Z",
@@ -350,11 +420,15 @@ Claude's picks plus continue watching. Optional `?who=person1`. Fast: it returns
 ```
 - Built from the bridge's own history: everything played through `/api/play`, plus what any app
   reported as playing when started by hand (see `playing` above). So it covers every app that
-  reports its title, not only the ones we opened.
+  reports its title, not only the ones we opened. A title counts after a minute of the same title
+  playing (and the app's own position past a minute), so autoplay previews stay out; a title that
+  is only the app's own name ("PrimeVideo") never counts. History from before 0.9 has no TV and no
+  person on it and is not listed; imported history feeds the picks, not this row.
 - Android's own Watch Next list (what Google's home shows) is not readable on this TV: it needs a
   system permission that ADB does not have. If that ever changes, those rows appear here with
   `"source": "tv"` and a real `progress` (0 to 1). Until then `progress` is `null`.
-- Resume with `POST /api/continue/open {"id": "h-0"}`. It reopens the show in its app; the app
+- Resume with `POST /api/continue/open {"id": "3f2a9c1e0b7d4a55"}`. The id is the history line's
+  own, so it always opens that card's show (and season and episode). It reopens the show in its app; the app
   itself picks up where you left off (Netflix, Stan, iview and the rest remember the position).
   Response is the same as `POST /api/play`.
 
@@ -393,6 +467,30 @@ settings over ADB and picks the row with the other name.
   off or no ADB).
 - A TV without a `picture` entry answers `{"ok": true, "mode": null, "supported": false,
   "can_set": false}` and `POST` answers `409`. The bridge never reads or changes its picture mode.
+
+### `GET /api/bluetooth-audio` and `POST /api/bluetooth-audio`
+Bluetooth settings screen opener, for the home screen's `headphones` quick button.
+Opens Android's own Bluetooth settings screen on the TV.
+```json
+GET /api/bluetooth-audio
+```
+Response:
+```json
+{
+  "ok": true,
+  "supported": true
+}
+```
+Open Bluetooth settings screen:
+```json
+POST /api/bluetooth-audio
+```
+Response:
+```json
+{"ok": true}
+```
+Runs the fixed command `am start -a android.settings.BLUETOOTH_SETTINGS` over ADB with no input from the request. No MAC addresses leave the bridge.
+
 
 ### App order: `POST /api/home-apps`, `GET /api/app-order`, `POST /api/app-order`
 The order of the TV home's dock and where the More apps line sits, per TV (add `?tv=` or `"tv"`).
@@ -442,15 +540,28 @@ is optional:
 
 | Key | What it is |
 |---|---|
-| `lang` | `en`, `es` or `es-MX`. |
+| `lang` | `en`, `es`, `es-MX`, `it`, `de` or `tr`. |
 | `place` | The weather's place: `name`, `lat`, `lon` (rounded to two decimals, a town, never a house), `timezone`. |
 | `wx_show`, `wx_unit`, `wx_every` | Weather on or off, `c` or `f`, minutes between checks (15, 30 or 60). |
-| `look` | `night` or `classic`. |
+| `look` | `night`, `oled` (the Classic grid on pure black) or `classic`. |
+| `glass` | Glass panels: `off`, `on` or `lite` (no blur). |
+| `glass_icons` | Glass app icons: `true` or `false`. |
+| `moving_tiles` | The focused tile's slow sway: `true` or `false`. |
+| `lighter` | Lighter home for a slow box (no blur, no soft shadows, a still photo, smaller pictures): `true` or `false`. |
+| `glass_amount` | How clear the glass is: `1` (frosted) to `5` (very clear). |
+| `clock_style` | The Night clock: `frosted` or `liquid`. |
+| `glass_focus` | Glass app icons, the focused app: `colour` or `glass`. |
+| `now_playing` | The Now playing card: `true` or `false`. |
+| `nav_sound` | The navigation sound: `system`, `soft` or `off`. |
+| `video`, `video_url` | The video background on or off, and its link (`http://` or `https://`, an MP4 or MOV). `""` means the link was removed on the TV, and then wins over `home.video_url`. |
 | `scene_order`, `scenes_off` | Every scene in order, and the ones switched off. Ids are the five scene names and `p-<id>` for a photo. |
 | `scene_seconds`, `clock` | 5 to 3600; `12h` or `24h`. |
-| `photos` | Up to 20: `{"id", "url"}` for a photo on the web, or `{"id", "file"}` for one the TV's file picker copied into the app (`p....jpg`, kept on the TV only). |
+| `sun_sync` | Follow the sun on or off: `true` or `false`. |
+| `ambient_weather`, `ambient_sun_grade` | Weather effects over the scenes, and the sun's colour grade: `true` or `false`, both off unless chosen. |
+| `photos` | Up to 50 (`MAX_PHOTOS` in `server.py`; the rest are dropped). Each photo is kept on the TV and read into its memory when it shows, so a very old or low memory TV may stutter near the limit: `{"id", "url"}` for a photo on the web, or `{"id", "file"}` for one the TV's file picker copied into the app (`p....jpg`, kept on the TV only). |
 | `hidden_apps` | Packages hidden from the home and More apps on this TV. |
-| `quick` | The quick buttons, in order: any of `sleep`, `picture`, `look`, `input`. |
+| `soundscape` | Ambient sleep sound: `{"type": "rain", "volume": 0.5, "fade_with_sleep": true}`. `type` is `off`, `rain`, `fire`, `waves` or `brown`, `volume` 0 to 1. It never plays by itself: it starts only when someone presses the Soundscape button or the row in Home settings. |
+| `quick` | The quick buttons, in order: any of `sleep`, `picture`, `look`, `soundscape`, `input`. |
 
 Unknown keys and wrong shapes are dropped. Larger than 32 KB answers `413`. With no bridge (option
 A) the TV keeps them alone. The on-TV app (option C) keeps them in its own `/api/settings` under
@@ -527,6 +638,9 @@ to a TV that is on does nothing. `on` only answers once the TV says it is on: ab
 the first minute after "off" (standby, still on the network), about 2 s after that (the TV has
 left the network; the bridge sends Wake-on-LAN and reconnects the moment it is back). It gives up
 after 32 s with `503`: then show "Turn the TV on with its own remote".
+LG only: an `off` sent again within 20 s of the TV going off counts as `on` (the phone's state can
+lag behind Quick Start+ standby, so a second press means "wake it"). A script or agent that repeats
+`off` should wait 20 s or check `power` first.
 ```json
 {"ok": true, "power": "on"}
 ```
@@ -614,7 +728,9 @@ off it tries again hourly.
 | default TV | `bridge/data/keep-disabled.json` |
 | any other TV | `bridge/data/keep-disabled.<tv id>.json` |
 
-`tv-home/tools/apply.sh` writes the list for the TV it sets up.
+`tv-home/tools/apply.sh` writes the list for the TV it sets up (ambient mode and any ad tracker).
+The guard never switches off the TV's own home screens or the setup wizard, even if an old list
+names them: with those off, some Google TVs loop at power on.
 
 A JSON array of package names. Undo for a TV: empty that TV's list first, then re-enable the
 apps (otherwise the guard switches them off again the next day). Each undo script empties only
@@ -626,6 +742,16 @@ Every title object (find result, play, playing, continue, picks) carries `poster
 URLs. Credit "Data from JustWatch" somewhere quiet (their terms).
 
 ## Change notes
+- 2026-11-10: Optional pairing key (`bridge.pairing_key`), rate limiting on wrong keys across all endpoints (HTTP 429), Host header allowlist against DNS rebinding (HTTP 403), disallowed origin rejection before handlers run (HTTP 403), dropping of couchtv_key cookie, tighter CORS origin allowlist (bridge host and TV home origins only), Content-Type enforcement on POST bodies (HTTP 415), and `POST /api/pair` (#73).
+- Roku: `"kind": "roku"` in `config.json`, `GET /api/roku/apps`, `GET /api/roku/icon/<id>` and `ecp` and `hook` on a Roku in
+  `GET /api/tvs`. `POST /api/key` takes Roku's own key names too (`InputHDMI1`, `Rev`, `Fwd`) and `roku_home` for Roku's Home;
+  `home` opens the couch-tv channel.
+- German: `lang` in `/api/settings` and `home.language` take `de` (24 hour clock and `DE` as the
+  country when they are not set).
+- Italian: `lang` in `/api/settings` and `home.language` take `it`. `home.clock` and
+  `home.language` in `/api/config` and `/tv/config.js` are now there only when `config.json` sets
+  them; without them the TV home follows the TV's own language and that language's usual clock.
+  An older TV home reads a missing one as `12h` and `en`, as before.
 - `GET|POST /api/settings` (Home settings made on the TV: language, weather place and units,
   look, scenes, photos, quick buttons, hidden apps). `home.language` in `/api/config` and
   `/tv/config.js`.

@@ -55,10 +55,22 @@ WEATHER = {"lat": -33.8688, "lon": 151.2093, "place": "Sydney", "timezone": "Aus
            **(CONFIG.get("weather") or {})}
 SCREENS = CONFIG.get("screens") or []
 BRIDGE = {"host": "your-computer.local", "port": 5400, "fallback_hosts": [], **(CONFIG.get("bridge") or {})}
+PAIRING_KEY = str(BRIDGE.get("pairing_key") or os.environ.get("BRIDGE_KEY") or "").strip()
+# The key travels in URLs (TV homes, Roku, the events stream) and on the TV's shell command line
+# (apply.sh), so it is letters, digits, - and _ only, and long enough that guessing it is no use.
+if PAIRING_KEY and not re.fullmatch(r"[A-Za-z0-9_-]{12,128}", PAIRING_KEY):
+    raise SystemExit("bridge.pairing_key: use 12 to 128 letters, digits, - or _ "
+                     "(for example: python3 -c 'import secrets; print(secrets.token_urlsafe(18))')")
 CLIENT_NAME = CONFIG.get("client_name", "Couch TV bridge")
 
+# The languages the TV home and the phone remote speak (tv-home/web/i18n.js, remote/src/i18n.js).
+LANGUAGES = ("en", "es", "es-MX", "it", "de", "tr", "fr")
 # Where shows stream (JustWatch) and what the prompts call the country: "country" in config.json.
-COUNTRY = str(CONFIG.get("country") or "AU").upper()
+# Without it: the country of the home's language, where it has one of its own (Italian: IT,
+# German: DE, Turkish: TR), else AU.
+_LANGUAGE_COUNTRY = {"it": "IT", "de": "DE", "tr": "TR"}
+_language = CONFIG["home"].get("language") if isinstance(CONFIG.get("home"), dict) else None
+COUNTRY = str(CONFIG.get("country") or _LANGUAGE_COUNTRY.get(str(_language)) or "AU").upper()
 _COUNTRY_NAMES = {
     "AU": "Australia", "NZ": "New Zealand", "US": "the United States", "GB": "the United Kingdom",
     "UK": "the United Kingdom", "IE": "Ireland", "CA": "Canada", "IN": "India", "ZA": "South Africa",
@@ -197,6 +209,15 @@ def _share(value, lo, hi):
     return round(max(lo, min(hi, float(value))), 3)
 
 
+SOUNDSCAPE_TYPES = ("off", "rain", "fire", "waves", "brown")
+
+
+def _float(value, default, lo, hi):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return round(max(lo, min(hi, float(value))), 2)
+
+
 def _my_scenes(items):
     """home.my_scenes: your own scenes (tv-home/tools/make-scene.py, docs/MAKE-A-SCENE.md). Only the
     keys the TV home reads, with safe values; the page checks them again."""
@@ -230,25 +251,127 @@ def _home(h):
     ids = SCENE_IDS + [m["id"] for m in mine]
     scenes = [s for s in dict.fromkeys(h.get("scenes") or []) if s in ids] if isinstance(h.get("scenes"), list) else []
     hide = h.get("hide_packages") if isinstance(h.get("hide_packages"), list) else []
-    return {
+    out = {
         # Android package names never shown on the home or in More apps (a maker's own clutter).
         "hide_packages": [p for p in dict.fromkeys(hide) if isinstance(p, str) and re.fullmatch(r"[A-Za-z0-9_.]{1,200}", p)],
-        "look": h.get("look") if h.get("look") in ("night", "classic") else "night",
+        "look": h.get("look") if h.get("look") in ("night", "classic", "oled") else "night",
         "scenes": scenes or list(SCENE_IDS),
         "scene_seconds": _int(h.get("scene_seconds"), 20, 5, 3600),
-        "clock": "24h" if str(h.get("clock")).lower() == "24h" else "12h",
         "dock_size": _int(h.get("dock_size"), DOCK_LIMIT, 1, DOCK_LIMIT),
-        # the TV home's language until someone picks one in Home settings: en, es or es-MX
-        "language": h.get("language") if h.get("language") in ("en", "es", "es-MX") else "en",
         # your own scenes, in backgrounds/mine/ (docs/MAKE-A-SCENE.md)
         "my_scenes": mine,
     }
+    # Only when config.json gives them. Without "language" the TV home speaks the TV's own language
+    # (English if it is not one of LANGUAGES), and without "clock" it uses that language's usual
+    # clock (24 hour in Italian and German, else 12 hour). Home settings on the TV win over both.
+    clock = str(h.get("clock") or "").lower()
+    if clock in ("12h", "24h"):
+        out["clock"] = clock
+    if h.get("language") in LANGUAGES:
+        out["language"] = h["language"]
+    # The setup's answer to "tell you when a new version is out?": notify (the TV looks once a week)
+    # or manual (only "Check for updates now"). Without it the TV home asks once on screen.
+    if h.get("updates") in ("notify", "manual"):
+        out["updates"] = h["updates"]
+    # Glass panels (on, or lite: no blur for slower TVs) and a looping video background, a link to
+    # an MP4 or MOV. Both off unless config.json or Home settings on the TV switches them on.
+    if h.get("glass") in ("off", "on", "lite"):
+        out["glass"] = h["glass"]
+    if isinstance(h.get("glass_icons"), bool):
+        out["glass_icons"] = h["glass_icons"]
+    # the focused tile's slow sway (#52): on, or off for a TV that flickers
+    if isinstance(h.get("moving_tiles"), bool):
+        out["moving_tiles"] = h["moving_tiles"]
+    # lighter home for a slow box (#58): no blur, no soft shadows, a still photo, smaller pictures
+    if isinstance(h.get("lighter"), bool):
+        out["lighter"] = h["lighter"]
+    # false: a 4K screen with a weak chip keeps the 1080 backgrounds (lg/build.py then leaves the 4K copies out)
+    if isinstance(h.get("hi_res"), bool):
+        out["hi_res"] = h["hi_res"]
+    # how clear the glass is, 1 (frosted) to 5 (very clear), and the Night clock's style
+    if isinstance(h.get("glass_amount"), int) and not isinstance(h.get("glass_amount"), bool) and 1 <= h["glass_amount"] <= 5:
+        out["glass_amount"] = h["glass_amount"]
+    if h.get("clock_style") in ("frosted", "liquid"):
+        out["clock_style"] = h["clock_style"]
+    # temperature unit for the weather: c or f (#56). Home settings on the TV win over it.
+    if h.get("wx_unit") in ("c", "f"):
+        out["wx_unit"] = h["wx_unit"]
+    # Now playing on or off (#31), and the navigation sound: the TV's own, soft or off (#32)
+    if isinstance(h.get("now_playing"), bool):
+        out["now_playing"] = h["now_playing"]
+    if isinstance(h.get("ambient_music"), bool):
+        out["ambient_music"] = h["ambient_music"]
+    if isinstance(h.get("sun_sync"), bool):
+        out["sun_sync"] = h["sun_sync"]
+    if isinstance(h.get("ambient_weather"), bool):
+        out["ambient_weather"] = h["ambient_weather"]
+    if isinstance(h.get("ambient_sun_grade"), bool):
+        out["ambient_sun_grade"] = h["ambient_sun_grade"]
+    if h.get("nav_sound") in ("system", "soft", "off"):
+        out["nav_sound"] = h["nav_sound"]
+    if h.get("glass_focus") in ("colour", "glass"):   # glass app icons: the focused app (#32)
+        out["glass_focus"] = h["glass_focus"]
+    vid = h.get("video_url")
+    if isinstance(vid, str) and re.match(r"https?://", vid) and len(vid) <= 2000:
+        out["video_url"] = vid
+    skip_wn = h.get("skip_watch_next") if isinstance(h.get("skip_watch_next"), list) else []
+    out["skip_watch_next"] = [p for p in dict.fromkeys(skip_wn) if isinstance(p, str) and re.fullmatch(r"[A-Za-z0-9_.]{1,200}", p)]
+    out["bedtime_dim"] = h.get("bedtime_dim") is True
+    soundscape = h.get("soundscape")
+    if isinstance(soundscape, dict):
+        snd_type = soundscape.get("type")
+        if snd_type in SOUNDSCAPE_TYPES:
+            out["soundscape"] = {
+                "type": snd_type,
+                "volume": _float(soundscape.get("volume"), 0.5, 0.0, 1.0),
+                "fade_with_sleep": soundscape.get("fade_with_sleep") is not False,
+            }
+    elif isinstance(soundscape, str) and soundscape in SOUNDSCAPE_TYPES:
+        out["soundscape"] = {
+            "type": soundscape,
+            "volume": 0.5,
+            "fade_with_sleep": True,
+        }
+    out["watch_next_per_app"] = _int(h.get("watch_next_per_app"), 5, 1, 20)
+    if "inputs" in h:
+        out["inputs"] = _inputs(h.get("inputs"))
+    return out
+
+
+def _inputs(raw_list):
+    if not isinstance(raw_list, list):
+        return []
+    valid_icons = {"ps5", "xbox", "switch", "hdmi", "cable", "pc"}
+    out = []
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or item.get("name") or "").strip()[:30]
+        if not label:
+            continue
+        icon = str(item.get("icon") or "").strip().lower()
+        if icon not in valid_icons:
+            icon = "hdmi"
+        entry = {"label": label, "icon": icon}
+        if "port" in item and isinstance(item["port"], int) and 1 <= item["port"] <= 8:
+            entry["port"] = item["port"]
+        if "match" in item and isinstance(item["match"], str) and item["match"].strip():
+            entry["match"] = item["match"].strip()[:50]
+        if "id" in item and isinstance(item["id"], str) and item["id"].strip():
+            entry["id"] = item["id"].strip()[:200]
+        if "device" in item and isinstance(item["device"], str) and item["device"].strip():
+            entry["device"] = item["device"].strip()[:50]
+        if "port" in entry or "match" in entry or "id" in entry or "device" in entry:
+            out.append(entry)
+        if len(out) >= 8:
+            break
+    return out
 
 
 HOME = _home(CONFIG.get("home"))
 
 # ---------- quick settings (per TV) and picture modes ----------
-QUICK_IDS = ["sleep", "picture", "look", "input"]
+QUICK_IDS = ["sleep", "picture", "look", "soundscape", "screen_off", "input", "screensaver", "headphones"]
 
 
 def quick_for(tv_cfg):

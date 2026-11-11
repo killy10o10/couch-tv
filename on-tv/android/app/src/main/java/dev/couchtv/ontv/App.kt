@@ -51,7 +51,11 @@ class App : Application() {
         val inForeground get() = resumed > 0
 
         fun startService(c: Context) {
-            runCatching { c.startForegroundService(Intent(c, BridgeService::class.java)) }
+            runCatching {
+                val i = Intent(c, BridgeService::class.java)
+                // Android 7 (Fire OS 6) has no startForegroundService; the plain start is allowed there
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) c.startForegroundService(i) else c.startService(i)
+            }
                 .onFailure { Log.w("couchtv", "could not start the service: ${it.message}") }
         }
 
@@ -120,8 +124,14 @@ class BridgeService : Service() {
     override fun onCreate() {
         super.onCreate()
         val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(NotificationChannel("bridge", "Couch TV remote", NotificationManager.IMPORTANCE_LOW))
-        val n = Notification.Builder(this, "bridge").setContentTitle("Couch TV").setContentText("Phone remote is on")
+        // Notification channels start at Android 8; Android 7 (Fire OS 6) builds the notification without one
+        val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            nm.createNotificationChannel(NotificationChannel("bridge", "Couch TV remote", NotificationManager.IMPORTANCE_LOW))
+            Notification.Builder(this, "bridge")
+        } else {
+            @Suppress("DEPRECATION") Notification.Builder(this)
+        }
+        val n = b.setContentTitle("Couch TV").setContentText("Phone remote is on")
             .setSmallIcon(R.drawable.icon).setOngoing(true).build()
         // The typed startForeground and FOREGROUND_SERVICE_TYPE_SPECIAL_USE only exist on Android 14.
         // Older TVs (Android 9 to 13) crash on them, so they get the plain call.
@@ -137,8 +147,29 @@ class BridgeService : Service() {
         Now.start()
         Thread {
             runCatching { if (Adb.everAllowed || Adb.paired) Adb.ensure() }
+            reenableStockHome()
             FireHome.poke()   // Fire TV: keep this home on the Home key across reboots
         }.start()
+    }
+
+    /**
+     * couch-tv 0.10 and older switched off the TV's own home screens and setup wizard, which can leave
+     * a Google TV looping after a restart. Over the ADB connection this app already holds (nothing new
+     * is asked for), switch those three packages back on, once, only if installed and switched off.
+     * If ADB is not connected yet, the next start tries again.
+     */
+    private fun reenableStockHome() {
+        if (Store.bool("stock_home_reenabled") || !Adb.connected) return
+        runCatching {
+            val off = Adb.shell("pm list packages -d", 10_000).lines().map { it.removePrefix("package:").trim() }
+            for (p in listOf("com.google.android.apps.tv.launcherx", "com.google.android.tvlauncher", "com.google.android.tungsten.setupwraith")) {
+                if (p in off) {
+                    Adb.shell("pm enable $p", 10_000)
+                    Log.w("couchtv", "switched $p back on (couch-tv 0.10 and older had switched it off)")
+                }
+            }
+            Store.putBool("stock_home_reenabled", true)
+        }.onFailure { Log.w("couchtv", "stock home re-enable failed: ${it.message}") }
     }
 
     private fun startServer() {
