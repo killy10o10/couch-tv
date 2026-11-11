@@ -123,7 +123,9 @@ object Doorbell {
             if (state == lastEvent) return
             lastEvent = state
             // the first look only learns the last press, unless that press was just now
-            val at = try { java.time.OffsetDateTime.parse(state).toInstant().toEpochMilli() } catch (e: Exception) { null }
+            // (java.time starts at Android 8, so on Android 7 the first look only learns the last press)
+            val at = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) null
+                else try { java.time.OffsetDateTime.parse(state).toInstant().toEpochMilli() } catch (e: Exception) { null }
             if (first && (at == null || System.currentTimeMillis() - at > FRESH_MS)) return
             ring(c, bell)
         } else {
@@ -232,16 +234,23 @@ object Doorbell {
         }.start()
     }
 
-    /** The card's words, in the language picked in Home settings (else home.language, else English). */
+    /**
+     * The card's words, in the language picked in Home settings (else home.language, else the TV's
+     * own language, as the home page does; English for any other).
+     */
     private fun words(c: Context): Pair<String, String> {
         val lang = try {
             c.getSharedPreferences("page", Context.MODE_PRIVATE).getString("tvhome.settings", null)
                 ?.let { JSONObject(it).optJSONObject("s")?.optString("lang") }?.takeIf { it.isNotEmpty() }
                 ?: c.getSharedPreferences("home", Context.MODE_PRIVATE).getString("config", null)
-                    ?.let { JSONObject(it).optJSONObject("home")?.optString("language") }
-        } catch (e: Exception) { null } ?: "en"
-        return if (lang.startsWith("es")) "Timbre" to "Hay alguien en la puerta"
-        else "Doorbell" to "Someone is at the door"
+                    ?.let { JSONObject(it).optJSONObject("home")?.optString("language") }?.takeIf { it.isNotEmpty() }
+        } catch (e: Exception) { null } ?: java.util.Locale.getDefault().language
+        return when {
+            lang.startsWith("es") -> "Timbre" to "Hay alguien en la puerta"
+            lang.startsWith("it") -> "Campanello" to "C'è qualcuno alla porta"
+            lang.startsWith("de") -> "Türklingel" to "Jemand ist an der Tür"
+            else -> "Doorbell" to "Someone is at the door"
+        }
     }
 
     private val CREAM = Color.parseColor("#F2EAD8")

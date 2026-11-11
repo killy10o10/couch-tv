@@ -118,9 +118,23 @@ export default function App() {
   const [people, setPeople] = useState([{ id: 'person1', name: 'Person 1' }, { id: 'person2', name: 'Person 2' }]);
   // ask.enabled false in config.json hides Ask; people can be any number (none: everything shows as Both)
   const [askOn, setAskOn] = useState(true);
+  // Glass app icons, the same look as the TV home's dock (#25): its Home settings, Look, Glass app
+  // icons wins, else home.glass_icons in config.json. Off unless the TV has it on.
+  // How clear the glass is, 1 to 5, follows the TV the same way (#29), and so does whether a
+  // pressed app shows its colours or stays glass (Focused app, #32).
+  const glass = useRef({ cfg: false, tv: null, amtCfg: 3, amtTv: null, focusCfg: null, focusTv: null });
+  const showGlass = () => {
+    const r = document.documentElement, g = glass.current, amt = g.amtTv ?? g.amtCfg;
+    r.classList.toggle('glass-icons', g.tv ?? g.cfg);
+    r.classList.toggle('gi-stay', (g.focusTv ?? g.focusCfg) === 'glass');
+    for (let i = 1; i <= 5; i++) r.classList.toggle(`ga-${i}`, amt === i);
+  };
+  const amount = (n) => (Number.isInteger(n) && n >= 1 && n <= 5 ? n : null);
+  // Apps hidden on the TV (hold OK on an app, Hide from home; or Home settings, Apps) stay hidden here too.
+  const [hidden, setHidden] = useState([]);
   // nobody set up: no picker, the remote shows everything
   useEffect(() => { if (!who && people.length === 0) setWho('both'); }, [people]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => { api.config().then((c) => { if (Array.isArray(c.people)) setPeople(c.people); if (c.ask && c.ask.enabled === false) setAskOn(false); }).catch(() => {}); }, []);
+  useEffect(() => { api.config().then((c) => { if (Array.isArray(c.people)) setPeople(c.people); if (c.ask && c.ask.enabled === false) setAskOn(false); glass.current.cfg = c.home?.glass_icons === true; glass.current.amtCfg = amount(c.home?.glass_amount) ?? 3; glass.current.focusCfg = c.home?.glass_focus ?? null; showGlass(); }).catch(() => {}); }, []);
   const [who, setWhoState] = useState(() => store.get('tv.who'));
   // Which TV this phone drives, remembered per phone. null is the bridge's default (living room).
   const [tvId, setTvIdState] = useState(() => { const id = store.get('tv.tv'); setTvId(id); return id; });
@@ -158,9 +172,23 @@ export default function App() {
   useEffect(() => { if (!toast) return undefined; const t = setTimeout(() => setToast(null), toast.text.length > 40 ? 4500 : 2600); return () => clearTimeout(t); }, [toast]);
 
   useEffect(() => { setTv(null); return subscribeNow(setTv, setReach); }, [tvId]);
-  useEffect(() => { api.tvs().then((d) => setTvs(d.tvs || [])).catch(() => {}); }, [reach, tvId]);
+  useEffect(() => {
+    const load = () => api.tvs().then((d) => setTvs(d.tvs || [])).catch(() => {});
+    load();
+    // also every 10 minutes, so a Developer Mode warning shows without reopening the app
+    const iv = setInterval(load, 600000);
+    return () => clearInterval(iv);
+  }, [reach, tvId]);
   // "Same as the TV": the language picked in the TV home's Home settings
-  useEffect(() => { api.settings().then((d) => setTvLang(d.settings?.lang)).catch(() => {}); }, [reach, tvId]);
+  // and its look and hidden apps
+  useEffect(() => { api.settings().then((d) => {
+    const s = d.settings || {};
+    setTvLang(s.lang);
+    glass.current.tv = typeof s.glass_icons === 'boolean' ? s.glass_icons : null;
+    glass.current.amtTv = amount(s.glass_amount);
+    glass.current.focusTv = s.glass_focus === 'glass' || s.glass_focus === 'colour' ? s.glass_focus : null; showGlass();
+    setHidden(Array.isArray(s.hidden_apps) ? s.hidden_apps : []);
+  }).catch(() => {}); }, [reach, tvId]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { api.apps().then((d) => setApps(d.apps)).catch(() => setApps((a) => a || false)); api.screens().then((d) => setScreens(d.screens)).catch(() => {}); }, [reach]);
   useEffect(() => { if (tab === 'watch' && apps === false) api.apps().then((d) => setApps(d.apps)).catch(() => {}); }, [tab]); // eslint-disable-line react-hooks/exhaustive-deps
   const whoNow = useRef(who);
@@ -170,7 +198,7 @@ export default function App() {
     const w = who;
     api.recs(w).then((d) => { if (whoNow.current === w) setRecs(d); }).catch(() => { if (whoNow.current === w) setRecs((r) => r || false); });
     api.continueList(w).then((d) => { if (whoNow.current === w) setCont(d.items); }).catch(() => { if (whoNow.current === w) setCont(undefined); });
-  }, [who]);
+  }, [who, tvId]); // each TV keeps its own Keep watching
   useEffect(() => { setRecs(null); setCont(null); loadRecs(); const t = setInterval(loadRecs, 10 * 60000); return () => clearInterval(t); }, [loadRecs]);
   useEffect(() => { if (reach && recs === false) loadRecs(); }, [reach]); // eslint-disable-line react-hooks/exhaustive-deps
   // Back from the lock screen: fetch the lists again, they may be hours old.
@@ -311,17 +339,18 @@ export default function App() {
   const remote = (
     <div className="remote-col">
       <div className="pull-zone" {...pull}>
+      {(() => { const d = (thisTv || (tvs.length === 1 ? tvs[0] : null))?.devmode; if (!d?.warning) return null; const said = d.warning_key ? t(d.warning_key, d.warning_vars) : d.warning; return <div className={`devwarn ${d.level || 'warn'}`} role="alert">{said === d.warning_key ? d.warning : said}</div>; })()}
       <TopBar people={people} tvName={thisTv?.name} who={who} setWho={pickWho} tv={tv} appInfo={appById[tv?.app?.id]} reach={reach} sleepLeft={sleepLeft} onPower={onPower} onMore={() => setSheet('more')} />
       {tvId && <button className="tv-chip glass" onClick={() => { tick(); setSheet('more'); }}><Ic.Screen size={15} /> {t('this_tv', { name: thisTv?.name || t('this') })}</button>}
       <NowPlaying tv={tv} appInfo={appById[tv?.app?.id]} onKey={onKey} roomy={h >= 760} />
       </div>
-      <Pad onKey={onKey} offState={offState} wakeError={wakeError} onWake={onWake} onRetry={onRetry}
+      <Pad onPointer={(thisTv || (tvs.length === 1 ? tvs[0] : null))?.kind === 'lg' ? (d) => api.pointer(d) : null} onKey={onKey} offState={offState} wakeError={wakeError} onWake={onWake} onRetry={onRetry}
         tvName={thisTv?.name} onLivingRoom={() => { tick(); chooseTv(null); }} />
       <Controls tv={tv} onKey={onKey} onVolume={onVolume} />
       {wide && askOn && <AskButton onAsk={openAsk} quiet={Boolean(offState)} />}
     </div>
   );
-  const watch = <Watch pull={pull} people={people} who={who || people[0]?.id || 'both'} recs={recs} cont={cont === undefined ? (recs === false ? false : recs?.continue) : cont} apps={apps} screens={screens} serviceName={serviceName} onPlay={onPlay} onLaunch={onLaunch} onScreen={onScreen} wide={wide} />;
+  const watch = <Watch pull={pull} people={people} who={who || people[0]?.id || 'both'} recs={recs} cont={cont === undefined ? (recs === false ? false : recs?.continue) : cont} apps={apps} hidden={hidden} screens={screens} serviceName={serviceName} onPlay={onPlay} onLaunch={onLaunch} onScreen={onScreen} wide={wide} />;
 
   return (
     <div className={`app ${wide ? 'is-wide' : ''} ${offState ? 'is-off' : ''}`}>
@@ -349,7 +378,7 @@ export default function App() {
       <MoreSheet ref={moreSheet} open={sheet === 'more'} tvs={tvs} tvId={tvId || 'living-room'} onTv={(id) => { tick(); chooseTv(id); }}
         picture={tv?.picture} pictureInfo={pictureInfo} onPicture={onPicture} onClose={() => setSheet(null)} sleepEnds={sleepEnds} sleepError={sleepError} onSleep={onSleep}
         onKey={onKey} onText={(text) => run(api.text(text), t('sent_to_tv'))} onArrange={() => setSheet('arrange')} onPeople={() => setSheet('people')} />
-      <ArrangeSheet open={sheet === 'arrange'} onClose={() => setSheet(null)} tvName={thisTv?.name} />
+      <ArrangeSheet open={sheet === 'arrange'} onClose={() => setSheet(null)} tvName={thisTv?.name} hidden={hidden} />
       <PeopleSheet open={sheet === 'people'} onClose={() => setSheet(null)} onSaved={(list) => { setPeople(list); if (who && who !== 'both' && !list.some((p) => p.id === who)) setWho(list[0]?.id || 'both'); }} />
       {!who && people.length > 0 && <Onboarding people={people} standalone={standalone} onPick={pickWho} />}
     </div>

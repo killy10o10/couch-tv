@@ -1,34 +1,19 @@
 # couch-tv on a Fire TV Stick
 
-This fork runs couch-tv's on-TV app (`dev.couchtv.ontv`, option C) as the home screen of a
+Written by [killy10o10](https://github.com/killy10o10/couch-tv), who runs couch-tv's on-TV app
+(`dev.couchtv.ontv`, option C) as the home screen of a
 **Fire TV Stick 4K (2nd gen, model AFTKM) on Fire OS 8.1.8.5 (Android 11)**. Everything below was
 done on that stick. Other Fire OS 7 and 8 sticks should behave the same; sticks on **Vega OS**
 cannot sideload apps at all.
 
 ![couch-tv on the Fire TV Stick](screens/firestick-home.jpg)
 
-## What this fork adds
+## The Fire TV extras
 
 - **Bluetooth and Network buttons** at the top right of the home. Fire OS's long-press Home menu
   has neither. On a Fire TV they open Amazon's own screens (Fire OS has no Bluetooth settings
   action); other TVs get Android's standard ones.
-- **Amazon's YouTube app** (`com.amazon.firetv.youtube`) counts as YouTube, so the dock, the phone
-  remote and YouTube video links open in it, and a video link starts playing. couch-tv only knew
-  Google's YouTube package, which a Fire TV doesn't have. A YouTube *search* link opens the app
-  but not the results: Amazon's YouTube ignores the search part of the link.
-
-Found on this stick and now part of the upstream project
-([#3](https://github.com/Seagey/couch-tv/issues/3), [#4](https://github.com/Seagey/couch-tv/issues/4),
-[#5](https://github.com/Seagey/couch-tv/pull/5)):
-
-- **Home settings that change the look take effect.** The on-TV app's WebView cancelled every
-  page load, including the home's own reload, so the Look button, switching scenes on or off and
-  the scene timer were saved but never shown.
-- **TV settings opens.** Android's plain Settings action goes through Amazon's home on its way to
-  Fire OS's Settings screen, so the Home watcher sent you straight back. couch-tv now opens that
-  screen (`com.amazon.tv.launcher/.ui.MainSettingsActivity`) by name.
-- **Builds that install over each other**, with a fixed key from the `DEBUG_KEYSTORE` secret
-  ([Signing](#signing-your-own-builds)).
+- **Amazon's YouTube app** (`com.amazon.firetv.youtube`) is recognised as YouTube.
 
 ## What works, and what does not
 
@@ -39,10 +24,9 @@ Found on this stick and now part of the upstream project
 | Survives a restart | Yes (the accessibility watcher stays on) |
 | Bluetooth button | Yes. If parental controls are on, Fire OS asks for the Prime Video PIN first |
 | Network button | Yes |
-| Gear tile: Home settings, TV settings | Yes (TV settings opens Fire OS's own Settings) |
-| One scene only, or Classic look | Yes: switch the other scenes off in Home settings, Look and scenes; the home reloads with your choice |
-| Phone remote | Opening apps, "play by name" and the sleep timer work. Keys, typing, "what's playing" and power off need the TV's own ADB, and Fire OS 8.1.8.5 refuses it: Connect ADB is dropped by `adbd` within milliseconds, with no Allow prompt (a computer's ADB still works). Amazon's Fire TV phone app is the better remote here |
+| Phone remote | Opening apps works without ADB. Keys, typing and "what's playing" need the TV's own ADB (Connect ADB in the app) |
 | Keep watching | Only fills from shows started from the phone remote |
+| Amazon's YouTube app | Yes, shown and sorted as YouTube |
 
 ## Install
 
@@ -58,18 +42,21 @@ network as the stick.
    ```sh
    adb connect <stick-ip>:5555
    ```
-4. **Install** `couch-tv-ontv.apk` (from this fork's Actions build, or the upstream Releases page):
+4. **Install** `couch-tv-ontv.apk` from [the Releases page](https://github.com/Seagey/couch-tv/releases):
    ```sh
    adb -s <stick-ip>:5555 install couch-tv-ontv.apk
    ```
 5. **Open Couch TV** on the stick and press **Use as home screen**. Skip Connect ADB unless you
    want the phone remote's keys.
-6. **Two grants** so it can take the Home key back (they survive restarts):
+6. **Three grants** so it can take the Home key back (they survive restarts):
    ```sh
    adb -s <stick-ip>:5555 shell pm grant dev.couchtv.ontv android.permission.WRITE_SECURE_SETTINGS
    adb -s <stick-ip>:5555 shell appops set dev.couchtv.ontv SYSTEM_ALERT_WINDOW allow
+   adb -s <stick-ip>:5555 shell appops set dev.couchtv.ontv GET_USAGE_STATS allow
    ```
-   (On Fire OS 8.1.8.5 the second was already `allow` after install; running it does no harm.)
+   (On Fire OS 8.1.8.5 the second was already `allow` after install; running it does no harm. The
+   third is for Fire OS 6, where the accessibility watcher never connects and the app watches usage
+   events instead; on 7 and 8 it is simply not used.)
 7. **Press "Use as home screen" after the grants** (if it was already on, press it off and on
    again). The app switches its accessibility watcher on when that switch is pressed and at every
    boot, and it needs the grant to be there first. Check it took:
@@ -118,35 +105,12 @@ curl -X POST http://<stick-ip>:5400/api/pair -H 'Content-Type: application/json'
   switched on but does not always reconnect it after the app is updated (seen on 8.1.8.5). A
   restart reconnects it. To check: `adb shell dumpsys accessibility | grep "Bound services"`
   should list "Couch TV home watch".
+- **Prime Video crashes at boot if you switched it off.** With Prime Video (`com.amazon.firebat`)
+  disabled, Fire OS still starts it at boot and it crashes 2 to 3 times in the log. That is
+  Amazon's and harmless.
 - **The setup screen remembers which button had focus.** Count your D-pad presses from what is
   highlighted, not from the left: it is easy to press Forget phones by mistake.
 - **Weather defaults to Sydney** until you set a place in Home settings or through the API.
-- **A fork's first GitHub build needs Actions switched on** (the fork's Actions tab, "I understand
-  my workflows"). Builds then run on every push.
-
-## Signing your own builds
-
-Android only installs an update signed with the same key as the app already on the TV. GitHub
-makes a new debug key for every run unless the fork has a fixed one:
-
-1. Make a key (any computer with `openssl`):
-   ```sh
-   openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 10950 -subj "/CN=Android Debug/O=Android/C=US"
-   openssl pkcs12 -export -inkey key.pem -in cert.pem -name androiddebugkey -passout pass:android -out couchtv.keystore
-   rm key.pem
-   base64 -i couchtv.keystore | tr -d '\n' | pbcopy      # macOS; on Linux: base64 -w0 couchtv.keystore
-   ```
-2. Add it to the fork: Settings, Secrets and variables, Actions, **New repository secret**, name
-   `DEBUG_KEYSTORE`. (It must be a repository secret, not an environment secret or a variable.)
-3. Push. The build log's **Which key signed them** step prints the fingerprint; it should match
-   `openssl x509 -in cert.pem -noout -fingerprint -sha256`.
-4. The first install signed with the new key has to replace the old one once
-   (`adb uninstall dev.couchtv.ontv`, then install). That clears the app's settings and the
-   `WRITE_SECURE_SETTINGS` grant, so redo Install steps 5 to 7. From then on, `adb install -r`
-   keeps everything.
-
-Keep the keystore out of the repo. Locally, `COUCHTV_KEYSTORE=/path/to/couchtv.keystore sh
-scripts/build-apk.sh` signs with the same key.
 
 ## Undo
 

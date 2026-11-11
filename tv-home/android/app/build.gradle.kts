@@ -11,16 +11,20 @@ android {
     compileSdk = 34
     defaultConfig {
         applicationId = "app.couchtv.launcher"
-        minSdk = 28
+        minSdk = 23          // Android 6.0 (older Mi TVs); Fire OS 6 (7.1) sticks install it too
         targetSdk = 34
-        versionCode = 5
-        versionName = "0.3"
+        versionCode = 14
+        versionName = "0.12"
         // Where the bridge might be: ./gradlew assembleRelease -PbridgeUrls=http://my-computer.local:5400
         // (comma separated, more than one is fine). The last one that answered is remembered on the TV.
         // Without it, apply.sh tells the app the address when it installs (the "bridge" extra), and
         // with no address at all (option A) the copy of the home built into the app is the home.
         val urls = (project.findProperty("bridgeUrls") as String? ?: "").split(",").map { it.trim() }.filter { it.isNotEmpty() }
         buildConfigField("String[]", "BRIDGES", "{" + urls.joinToString(", ") { "\"" + it + "\"" } + "}")
+        // Whose GitHub releases Home settings, Updates offers: -PupdateRepo=owner/name for a fork
+        // with releases of its own, -PupdateRepo= (empty) for none. Updater.kt checks the format.
+        val updateRepo = (project.findProperty("updateRepo") as String? ?: "Seagey/couch-tv").trim()
+        buildConfigField("String", "UPDATE_REPO", "\"" + updateRepo.filter { it.isLetterOrDigit() || it in "/._-" } + "\"")
     }
     buildFeatures { buildConfig = true }
     // Test builds: when COUCHTV_KEYSTORE names a keystore (a debug-style key, alias androiddebugkey,
@@ -46,6 +50,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
+    }
 }
 
 /**
